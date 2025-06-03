@@ -44,18 +44,18 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (1, 1)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (100, 100)  # Resolution for zoom detail
+INTERNAL_THUMBNAIL_SIZE = (120, 120)  # High resolution for 300 DPI printing quality
 CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 250  # Include almost all brightness levels
-THUMBNAIL_LIMIT = 8000  # Number of thumbnails to use (adjust based on memory) - more for better variety
+THUMBNAIL_LIMIT = 6000  # Reduced from 8000 to optimize memory and file size
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
 FOREGROUND_THRESHOLD = 0.08  # Sensitivity to foreground detection
 POSITION_RANDOMNESS = 0.05  # Very low randomness for precision
 DETAIL_SENSITIVITY = 1.0  # Maximum detail sensitivity
 USE_VARIABLE_SIZES = True  # Use variable thumbnail sizes for better detail
 EDGE_ALIGNMENT = True  # Align thumbnails with edges for better detail definition
-MIN_THUMBNAIL_SCALE = 0.1  # Very small thumbnails for fine details
+MIN_THUMBNAIL_SCALE = 0.15  # Slightly larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
 
 def get_average_color(img):
@@ -90,19 +90,40 @@ def get_edge_orientation(edges, x, y, window_size=15):
         return 0  # Default no rotation
         
     try:
-        # Use Hough transform to find dominant line orientation
-        h, theta, d = feature.hough_line(window > 0)
-        if len(h) > 0 and np.max(h) > 0:
-            # Return the angle of the most prominent line
-            idx = np.argmax(h)
-            angle_rad = theta[idx]
-            angle_deg = angle_rad * 180 / np.pi
-            # Convert to 0, 90, 180, or 270 for simplicity
+        # Check if hough_line is available in the feature module
+        if hasattr(feature, 'hough_line'):
+            # Use Hough transform to find dominant line orientation
+            h, theta, d = feature.hough_line(window > 0)
+            if len(h) > 0 and np.max(h) > 0:
+                # Return the angle of the most prominent line
+                idx = np.argmax(h)
+                angle_rad = theta[idx]
+                angle_deg = angle_rad * 180 / np.pi
+                # Convert to 0, 90, 180, or 270 for simplicity
+                angles = [0, 90, 180, 270]
+                closest_angle = min(angles, key=lambda a: abs((angle_deg % 180) - a))
+                return closest_angle
+        else:
+            # Fallback: use simple gradient-based orientation detection
+            # Calculate gradients in x and y directions
+            grad_x = np.gradient(window.astype(float), axis=1)
+            grad_y = np.gradient(window.astype(float), axis=0)
+            
+            # Calculate dominant orientation using arctangent
+            angles = np.arctan2(grad_y, grad_x) * 180 / np.pi
+            # Get the most common angle (simplified)
+            hist, bins = np.histogram(angles.flatten(), bins=8, range=(-180, 180))
+            dominant_angle_idx = np.argmax(hist)
+            dominant_angle = (bins[dominant_angle_idx] + bins[dominant_angle_idx + 1]) / 2
+            
+            # Snap to nearest 90-degree increment
             angles = [0, 90, 180, 270]
-            closest_angle = min(angles, key=lambda a: abs((angle_deg % 180) - a))
+            closest_angle = min(angles, key=lambda a: abs((dominant_angle % 180) - a))
             return closest_angle
+            
     except Exception as e:
-        print(f"Error in edge orientation detection: {e}")
+        # Silently handle any errors and return default
+        pass
     
     return 0  # Default no rotation
 
@@ -382,54 +403,6 @@ def create_mosaic(img, thumbnails):
         # Generate a detail map for adaptive thumbnail placement
         detail_map = create_detail_map(enhanced_array, edges_array)
         
-        # Create a foreground mask using multiple techniques
-        
-        # 1. Use Otsu's method for automatic thresholding on the grayscale image
-        try:
-            if threshold_otsu:
-                threshold = threshold_otsu(enhanced_array)
-            else:
-                # Fallback if skimage is not available
-                threshold = np.mean(enhanced_array) * 0.8
-        except:
-            # Fallback if method fails
-            threshold = np.mean(enhanced_array) * 0.8
-        
-        # 2. Create the initial mask - invert so darker areas (typically subject) are True
-        foreground_mask1 = enhanced_array < threshold
-        
-        # 3. Use edge detection to enhance the mask
-        edge_threshold = np.max(edges_array) * 0.2  # Lower threshold to catch more edges
-        edge_mask = edges_array > edge_threshold
-        
-        # 4. Combine masks with logical OR to get a more comprehensive foreground mask
-        combined_mask = np.logical_or(foreground_mask1, edge_mask)
-        
-        # 5. Apply morphological operations to clean up the mask
-        # First close small holes
-        foreground_mask = ndimage.binary_closing(combined_mask, structure=np.ones((7, 7)))
-        # Then remove small isolated regions
-        foreground_mask = ndimage.binary_opening(foreground_mask, structure=np.ones((3, 3)))
-        # Expand the mask slightly to cover the edges better
-        foreground_mask = ndimage.binary_dilation(foreground_mask, structure=np.ones((9, 9)))
-        
-        # 6. Use connected component analysis to keep only the largest blob (likely the person)
-        # Label connected components
-        labeled_mask, num_features = ndimage.label(foreground_mask)
-        if num_features > 1:
-            # Find the largest component (likely the person)
-            component_sizes = np.bincount(labeled_mask.ravel())[1:]  # Skip background (label 0)
-            largest_component = np.argmax(component_sizes) + 1  # +1 because labels start at 1
-            # Keep only the largest component
-            foreground_mask = labeled_mask == largest_component
-            # Dilate again for smoother edges
-            foreground_mask = ndimage.binary_dilation(foreground_mask, structure=np.ones((5, 5)))
-        
-        print(f"Created enhanced foreground mask for subject detection with {num_features} features detected")
-        
-        # Create a specific background mask with a buffer zone
-        background_mask = create_background_mask(foreground_mask)
-        
         # Use Canny edge detection for more precise edge orientation if skimage is available
         canny_edges = None
         if SKIMAGE_AVAILABLE and EDGE_ALIGNMENT:
@@ -439,28 +412,12 @@ def create_mosaic(img, thumbnails):
             except Exception as e:
                 print(f"Canny edge detection failed: {e}")
         
-        # Determine dominant color of background for themed thumbnails
-        # Calculate average color in background regions
-        background_pixels = original_array[background_mask]
-        if len(background_pixels) > 0:
-            avg_background_color = np.mean(background_pixels, axis=0).astype(int)
-            # Create a subset of thumbnails that match the background color theme
-            print(f"Creating background color theme with average color: {avg_background_color}")
-            background_thumbnails = filter_thumbnails_by_color(thumbnails, avg_background_color)
-            print(f"Selected {len(background_thumbnails)} thumbnails for background areas")
-        else:
-            background_thumbnails = thumbnails
-        
         # Process grid by extracting cell average colors first - use ORIGINAL image for colors
         cell_colors = []
-        cell_is_foreground = []
-        cell_is_background = []
         cell_detail_levels = []
         
         for y in range(n_rows):
             row_colors = []
-            row_foreground = []
-            row_background = []
             row_details = []
             for x in range(n_cols):
                 cell_x = x * CELL_SIZE[0]
@@ -470,16 +427,6 @@ def create_mosaic(img, thumbnails):
                 avg_color = np.array(get_average_color(cell).astype(int))
                 row_colors.append(avg_color)
                 
-                # Check if this cell is part of the foreground (person)
-                cell_mask = foreground_mask[cell_y:cell_y + CELL_SIZE[1], cell_x:cell_x + CELL_SIZE[0]]
-                is_foreground = np.mean(cell_mask) > FOREGROUND_THRESHOLD
-                row_foreground.append(is_foreground)
-                
-                # Check if this cell is part of the background
-                cell_bg_mask = background_mask[cell_y:cell_y + CELL_SIZE[1], cell_x:cell_x + CELL_SIZE[0]]
-                is_background = np.mean(cell_bg_mask) > 0.5  # More than half background
-                row_background.append(is_background)
-                
                 # Calculate detail level for this cell
                 detail_level = calculate_detail_level(cell, edges_array, cell_x, cell_y, CELL_SIZE[0], CELL_SIZE[1])
                 detail_level = min(1.0, detail_level * DETAIL_SENSITIVITY * 2.0)  # Amplify and clamp
@@ -487,8 +434,6 @@ def create_mosaic(img, thumbnails):
                 
                 del cell
             cell_colors.append(row_colors)
-            cell_is_foreground.append(row_foreground)
-            cell_is_background.append(row_background)
             cell_detail_levels.append(row_details)
         
         # Release the source images from memory
@@ -508,21 +453,9 @@ def create_mosaic(img, thumbnails):
                 # Get the average color
                 avg_color = cell_colors[y][x]
                 
-                # Choose thumbnail set based on cell location
-                if cell_is_foreground[y][x]:
-                    # Use all thumbnails for foreground to get best color match
-                    current_thumbnails = thumbnails
-                    # Higher detail level for important areas
-                    detail_level = max(detail_level, 0.4)
-                elif cell_is_background[y][x]:
-                    # Use themed thumbnails for background
-                    current_thumbnails = background_thumbnails
-                else:
-                    # Buffer zone - use all thumbnails
-                    current_thumbnails = thumbnails
-                
+                # Use all thumbnails for all areas (simplified approach)
                 # Find the best match with more weight on color accuracy in detailed areas
-                best_match = find_best_match(avg_color, current_thumbnails, detail_level)
+                best_match = find_best_match(avg_color, thumbnails, detail_level)
                 if not best_match:
                     continue
                     
@@ -609,14 +542,14 @@ def create_mosaic(img, thumbnails):
         print(traceback.format_exc())
         raise
 
-def save_mosaic(mosaic, output_path, quality=92):
-    """Save the mosaic to a file."""
+def save_mosaic(mosaic, output_path, quality=85):
+    """Save the mosaic to a file with optimized compression."""
     try:
         # Make sure the directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        # Save the mosaic
-        mosaic.save(output_path, format="JPEG", quality=quality)
+        # Save the mosaic with optimized JPEG settings
+        mosaic.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
         print(f"Mosaic saved to {output_path}")
         return True
     except Exception as e:
@@ -648,36 +581,6 @@ def load_image_from_s3(s3_key):
     except Exception as e:
         print(f"Error loading S3 image: {e}")
         return None
-
-def create_background_mask(foreground_mask, dilate_size=20):
-    """Creates a specific mask for background areas with a buffer zone around the foreground"""
-    # Create a copy of the foreground mask
-    # Dilate it substantially to create a buffer zone
-    buffer_mask = ndimage.binary_dilation(foreground_mask, structure=np.ones((dilate_size, dilate_size)))
-    
-    # Background is everything that's not in the buffer zone
-    background_mask = ~buffer_mask
-    
-    return background_mask
-
-def filter_thumbnails_by_color(thumbnails, target_color, threshold=60):
-    """Filter thumbnails to match a specific color theme"""
-    filtered = []
-    target_color = np.array(target_color)
-    
-    for thumbnail in thumbnails:
-        color_diff = np.sqrt(np.sum((thumbnail['avg_color'] - target_color)**2))
-        if color_diff < threshold:
-            filtered.append(thumbnail)
-    
-    # If we didn't get enough matches, return some portion of the originals
-    if len(filtered) < len(thumbnails) * 0.1:
-        # Sort by closest color match and take top 10%
-        sorted_thumbnails = sorted(thumbnails, 
-                                 key=lambda x: np.sqrt(np.sum((x['avg_color'] - target_color)**2)))
-        filtered = sorted_thumbnails[:max(10, int(len(thumbnails) * 0.1))]
-        
-    return filtered
 
 def main():
     # Declare globals at the beginning of the function
