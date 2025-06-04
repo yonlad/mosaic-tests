@@ -15,6 +15,8 @@ from datetime import datetime
 import argparse
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from skimage.filters import threshold_otsu
@@ -42,21 +44,21 @@ s3_client = boto3.client(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-# Mosaic configuration - you can adjust these parameters to experiment
-THUMBNAIL_SIZE = (2, 3)  # Size for display/layout
-INTERNAL_THUMBNAIL_SIZE = (250, 250)  # Resolution for zoom detail
-CELL_SIZE = (2, 2)  # Spacing between thumbnails (controls density)
-CONTRAST_FACTOR = 1  # Contrast enhancement for better edge detection
-BRIGHTNESS_THRESHOLD = 200  # Threshold for skipping very bright areas
-THUMBNAIL_LIMIT = 4000  # Number of thumbnails to use (adjust based on memory)
-SKIP_PROBABILITY = 0.005  # Lower = more thumbnails used in mosaic
-FOREGROUND_THRESHOLD = 0.08  # Sensitivity to foreground detection
-POSITION_RANDOMNESS = 0.15  # Randomness in thumbnail positions
-DETAIL_SENSITIVITY = 0.8  # Sensitivity to image details (0-1)
-USE_VARIABLE_SIZES = True  # Whether to use variable thumbnail sizes
-EDGE_ALIGNMENT = True  # Whether to align thumbnails with edges
-MIN_THUMBNAIL_SCALE = 0.1  # Minimum scale factor for thumbnails in detailed areas
-MAX_THUMBNAIL_SCALE = 1.2  # Maximum scale factor for thumbnails
+# Mosaic configuration - optimized for seamless detailed appearance
+THUMBNAIL_SIZE = (2, 2)  # Very small for seamless blending
+INTERNAL_THUMBNAIL_SIZE = (64, 64)  # Higher resolution for better detail
+CELL_SIZE = (2, 2)  # Match thumbnail size for dense, seamless coverage
+CONTRAST_FACTOR = 1.2  # Slight contrast boost for better feature definition
+BRIGHTNESS_THRESHOLD = 240  # Slightly lower to include more detail areas
+THUMBNAIL_LIMIT = 3000  # More thumbnails for better variety
+SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
+FOREGROUND_THRESHOLD = 0.03  # More sensitive to capture fine details
+POSITION_RANDOMNESS = 0.0  # Perfect grid alignment
+DETAIL_SENSITIVITY = 0.5  # Not used but kept for compatibility
+USE_VARIABLE_SIZES = False  # Uniform sizes for seamless appearance
+EDGE_ALIGNMENT = False  # Disabled for performance
+MIN_THUMBNAIL_SCALE = 0.8  # Not used when variable sizes disabled
+MAX_THUMBNAIL_SCALE = 1.0  # Not used when variable sizes disabled
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -109,168 +111,131 @@ def get_edge_orientation(edges, x, y, window_size=15):
 def find_best_match(target_color, thumbnails, cell_detail=0.0):
     """Find the thumbnail with the closest average color to the target color.
     
-    Args:
-        target_color: Target RGB color to match
-        thumbnails: List of thumbnail objects
-        cell_detail: Detail level of the cell (0-1)
-    
-    Returns:
-        Best matching thumbnail
+    Enhanced version for better color accuracy with tiny thumbnails.
     """
     min_distance = float('inf')
     best_match = None
     
     target_color = np.array(target_color).astype(float)
     
-    # Convert to LAB color space if scikit-image is available
-    if SKIMAGE_AVAILABLE:
-        try:
-            # Reshape and normalize to 0-1 range for skimage
-            target_rgb = target_color.reshape(1, 1, 3) / 255.0
-            # Convert to LAB color space
-            target_lab = color.rgb2lab(target_rgb).reshape(3)
-        except Exception as e:
-            print(f"Error converting to LAB color space: {e}")
-            # Fallback to RGB with weighted components
-            target_lab = None
-    else:
-        target_lab = None
+    # Use perceptually weighted RGB distance for better color matching
+    # These weights approximate human color perception
+    weights = np.array([0.299, 0.587, 0.114])  # Standard luminance weights
     
-    # Weight candidates differently based on detail level
-    # Higher detail cells need more accurate color matching
-    color_weight = 0.7 + 0.3 * cell_detail  # 0.7-1.0 based on detail
-    texture_weight = 1.0 - color_weight
+    # For very small thumbnails, we need more precise color matching
+    # Add a small amount of randomness to avoid repetitive patterns
+    candidates = []
     
-    candidate_thumbnails = []
-    
-    # First pass: calculate distances and keep top candidates
     for thumbnail in thumbnails:
-        if target_lab is not None:
-            # Use LAB color space for perceptual accuracy
-            thumbnail_rgb = thumbnail['avg_color'].reshape(1, 1, 3) / 255.0
-            thumbnail_lab = color.rgb2lab(thumbnail_rgb).reshape(3)
-            
-            # LAB distance (DE76)
-            distance = np.sum((target_lab - thumbnail_lab) ** 2)
-        else:
-            # Fallback to weighted RGB if LAB is not available
-            # Green is more perceptually important, followed by red, then blue
-            weights = np.array([0.3, 0.6, 0.1])  # RGB weights
-            
-            # Calculate weighted Euclidean distance
-            weighted_diff = (target_color - thumbnail['avg_color']) * weights
-            distance = np.sum(weighted_diff**2)
+        # Calculate weighted Euclidean distance in RGB space
+        diff = target_color - thumbnail['avg_color']
+        distance = np.sqrt(np.sum((diff * weights) ** 2))
         
-        # Add candidates with distance and thumbnail
-        candidate_thumbnails.append((distance, thumbnail))
+        candidates.append((distance, thumbnail))
     
-    # Sort by distance and pick the best match
-    if candidate_thumbnails:
-        # Sort by distance
-        candidate_thumbnails.sort(key=lambda x: x[0])
-        # Choose from the top candidates (introducing slight randomness for variety)
-        top_n = max(1, min(5, int(len(candidate_thumbnails) * 0.05)))
-        if top_n > 1 and random.random() < 0.3:  # 30% chance to pick a non-optimal match for variety
-            best_match = random.choice(candidate_thumbnails[:top_n])[1]
-        else:
-            best_match = candidate_thumbnails[0][1]
+    # Sort by distance and pick from the best matches
+    candidates.sort(key=lambda x: x[0])
+    
+    # For tiny thumbnails, occasionally pick from top 3 matches to avoid repetition
+    if len(candidates) >= 3 and random.random() < 0.15:  # 15% chance for variety
+        best_match = candidates[random.randint(0, 2)][1]
+    else:
+        best_match = candidates[0][1]
     
     return best_match
 
 def enhance_image(img, contrast_factor=CONTRAST_FACTOR):
-    """Minimal image enhancement focusing mainly on edge detection.
-    
-    This version is designed to be very gentle on colors while still
-    providing enough edge information for detail detection.
-    """
+    """Enhanced image processing for better detail preservation with tiny thumbnails."""
     # Convert to RGB if not already
     if img.mode != 'RGB':
         img = img.convert('RGB')
     
-    # Create a copy for edge detection only - we won't modify the original colors
-    edge_img = img.copy()
+    # Create a copy for processing
+    enhanced_img = img.copy()
     
-    # Apply a VERY mild sharpening for edge detection
-    # This won't affect the color matching, just helps with detail recognition
-    edge_img = edge_img.filter(ImageFilter.SHARPEN)
-    
-    # Skip the adaptive histogram equalization - it can cause color shifts
-    
-    # Skip contrast enhancement unless explicitly requested
+    # Apply subtle contrast enhancement for better feature definition
     if contrast_factor > 1.0:
-        enhancer = ImageEnhance.Contrast(edge_img)
-        edge_img = enhancer.enhance(contrast_factor)
+        enhancer = ImageEnhance.Contrast(enhanced_img)
+        enhanced_img = enhancer.enhance(contrast_factor)
     
-    # Skip brightness enhancement entirely
+    # Apply very subtle sharpening to help with detail detection
+    enhanced_img = enhanced_img.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
     
-    return edge_img
+    return enhanced_img
 
 def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix="selected-images/"):
     """Fetch thumbnail images from S3 bucket and process for mosaic use."""
     thumbnails = []
+    thumbnails_lock = threading.Lock()
+    
+    def process_s3_object(key):
+        """Process a single S3 object and return thumbnail data."""
+        try:
+            # Download the image from S3
+            response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            image_data = response['Body'].read()
+            
+            # Open image using PIL
+            img = Image.open(BytesIO(image_data))
+            
+            # Ensure the image is in RGB mode
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Create internal resolution version directly (skip preview step)
+            hi_res_img = img.resize(INTERNAL_THUMBNAIL_SIZE, Image.LANCZOS)
+            
+            # Calculate average color from the resized image
+            img_array = np.array(hi_res_img)
+            avg_color = np.mean(img_array, axis=(0, 1)).astype(int)
+            
+            return {
+                's3_key': key,
+                'avg_color': avg_color,
+                'image': hi_res_img,
+                'display_size': THUMBNAIL_SIZE
+            }
+            
+        except Exception as e:
+            print(f"Error processing S3 image {key}: {e}")
+            return None
     
     try:
         print(f"Fetching up to {limit} thumbnails from S3...")
         
-        # Create a paginator for listing objects
+        # Get list of all image keys first
         paginator = s3_client.get_paginator('list_objects_v2')
+        image_keys = []
         
-        # We'll count how many thumbnails we've processed
-        count = 0
-        
-        # Paginate through results
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
             if 'Contents' not in page:
                 continue
                 
             for obj in page['Contents']:
-                # Skip if not an image file
                 key = obj['Key']
-                if not key.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    continue
-                    
-                # Download the image from S3
-                try:
-                    response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-                    image_data = response['Body'].read()
-                    
-                    # Open image using PIL
-                    img = Image.open(BytesIO(image_data))
-                    
-                    # Ensure the image is in RGB mode
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    
-                    # Create a high-resolution version for internal storage
-                    hi_res_img = img.resize(INTERNAL_THUMBNAIL_SIZE, Image.LANCZOS)
-                    
-                    # Create a preview version for color matching (smaller memory footprint)
-                    preview_img = img.resize(THUMBNAIL_SIZE, Image.BILINEAR)
-                    
-                    # Calculate average color from the preview (faster than the hi-res)
-                    img_array = np.array(preview_img)
-                    avg_color = np.mean(img_array, axis=(0, 1)).astype(int)
-                    
-                    # Add to our thumbnails list
-                    thumbnails.append({
-                        's3_key': key,
-                        'avg_color': avg_color,
-                        'image': hi_res_img,  # Store the high-res version
-                        'display_size': THUMBNAIL_SIZE  # Remember the display size
-                    })
-                    
-                    # Clean up the preview to save memory
-                    del preview_img
-                    
-                    count += 1
-                    if count >= limit:
+                if key.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    image_keys.append(key)
+                    if len(image_keys) >= limit:
                         break
-                        
-                except Exception as e:
-                    print(f"Error processing S3 image {key}: {e}")
-                    
-            if count >= limit:
+            
+            if len(image_keys) >= limit:
                 break
+        
+        print(f"Found {len(image_keys)} images, processing with concurrent downloads...")
+        
+        # Process images concurrently
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all tasks
+            future_to_key = {executor.submit(process_s3_object, key): key for key in image_keys[:limit]}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_key):
+                result = future.result()
+                if result:
+                    with thumbnails_lock:
+                        thumbnails.append(result)
+                        if len(thumbnails) % 100 == 0:
+                            print(f"Processed {len(thumbnails)} thumbnails...")
                 
         print(f"Successfully fetched {len(thumbnails)} thumbnails for processing")
         
@@ -335,7 +300,7 @@ def create_mosaic(img, thumbnails):
         total_cells = n_cols * n_rows
         print(f"Creating high-resolution mosaic grid: {n_cols}x{n_rows} at {scale_factor}x scale")
         
-        # Use enhanced image for edge detection
+        # Use enhanced image for basic edge detection (simplified)
         enhanced_gray = enhanced_img.convert('L')
         edges = enhanced_gray.filter(ImageFilter.FIND_EDGES)
         
@@ -343,12 +308,7 @@ def create_mosaic(img, thumbnails):
         enhanced_array = np.array(enhanced_gray)
         edges_array = np.array(edges)
         
-        # Generate a detail map for adaptive thumbnail placement
-        detail_map = create_detail_map(enhanced_array, edges_array)
-        
-        # Create a foreground mask using multiple techniques
-        
-        # 1. Use Otsu's method for automatic thresholding on the grayscale image
+        # Simplified foreground detection using Otsu's method
         try:
             if threshold_otsu:
                 threshold = threshold_otsu(enhanced_array)
@@ -359,56 +319,23 @@ def create_mosaic(img, thumbnails):
             # Fallback if method fails
             threshold = np.mean(enhanced_array) * 0.8
         
-        # 2. Create the initial mask - invert so darker areas (typically subject) are True
-        foreground_mask1 = enhanced_array < threshold
+        # Create foreground mask - invert so darker areas (typically subject) are True
+        foreground_mask = enhanced_array < threshold
         
-        # 3. Use edge detection to enhance the mask
-        edge_threshold = np.max(edges_array) * 0.2  # Lower threshold to catch more edges
-        edge_mask = edges_array > edge_threshold
-        
-        # 4. Combine masks with logical OR to get a more comprehensive foreground mask
-        combined_mask = np.logical_or(foreground_mask1, edge_mask)
-        
-        # 5. Apply morphological operations to clean up the mask
-        # First close small holes
-        foreground_mask = ndimage.binary_closing(combined_mask, structure=np.ones((7, 7)))
-        # Then remove small isolated regions
+        # Apply basic morphological operations to clean up the mask
+        foreground_mask = ndimage.binary_closing(foreground_mask, structure=np.ones((5, 5)))
         foreground_mask = ndimage.binary_opening(foreground_mask, structure=np.ones((3, 3)))
-        # Expand the mask slightly to cover the edges better
-        foreground_mask = ndimage.binary_dilation(foreground_mask, structure=np.ones((9, 9)))
+        foreground_mask = ndimage.binary_dilation(foreground_mask, structure=np.ones((7, 7)))
         
-        # 6. Use connected component analysis to keep only the largest blob (likely the person)
-        # Label connected components
-        labeled_mask, num_features = ndimage.label(foreground_mask)
-        if num_features > 1:
-            # Find the largest component (likely the person)
-            component_sizes = np.bincount(labeled_mask.ravel())[1:]  # Skip background (label 0)
-            largest_component = np.argmax(component_sizes) + 1  # +1 because labels start at 1
-            # Keep only the largest component
-            foreground_mask = labeled_mask == largest_component
-            # Dilate again for smoother edges
-            foreground_mask = ndimage.binary_dilation(foreground_mask, structure=np.ones((5, 5)))
+        print(f"Created simplified foreground mask for subject detection")
         
-        print(f"Created enhanced foreground mask for subject detection with {num_features} features detected")
-        
-        # Use Canny edge detection for more precise edge orientation if skimage is available
-        canny_edges = None
-        if SKIMAGE_AVAILABLE and EDGE_ALIGNMENT:
-            try:
-                canny_edges = feature.canny(enhanced_array, sigma=2.0)
-                print("Applied Canny edge detection for edge-aware thumbnail placement")
-            except Exception as e:
-                print(f"Canny edge detection failed: {e}")
-        
-        # Process grid by extracting cell average colors first - use ORIGINAL image for colors
+        # Process grid by extracting cell average colors - use ORIGINAL image for colors
         cell_colors = []
         cell_is_foreground = []
-        cell_detail_levels = []
         
         for y in range(n_rows):
             row_colors = []
             row_foreground = []
-            row_details = []
             for x in range(n_cols):
                 cell_x = x * CELL_SIZE[0]
                 cell_y = y * CELL_SIZE[1]
@@ -419,26 +346,18 @@ def create_mosaic(img, thumbnails):
                 
                 # Check if this cell is part of the foreground (person)
                 cell_mask = foreground_mask[cell_y:cell_y + CELL_SIZE[1], cell_x:cell_x + CELL_SIZE[0]]
-                # Lower threshold to be more inclusive
                 is_foreground = np.mean(cell_mask) > FOREGROUND_THRESHOLD
                 row_foreground.append(is_foreground)
-                
-                # Calculate detail level for this cell
-                detail_level = calculate_detail_level(cell, edges_array, cell_x, cell_y, CELL_SIZE[0], CELL_SIZE[1])
-                detail_level = min(1.0, detail_level * DETAIL_SENSITIVITY * 2.0)  # Amplify and clamp
-                row_details.append(detail_level)
                 
                 del cell
             cell_colors.append(row_colors)
             cell_is_foreground.append(row_foreground)
-            cell_detail_levels.append(row_details)
         
         # Release the source images from memory
         del enhanced_img
         del original_img
         del enhanced_gray
         del edges
-        del foreground_mask
         gc.collect()
 
         # Process each cell to place high-resolution thumbnails
@@ -448,93 +367,40 @@ def create_mosaic(img, thumbnails):
                 if not cell_is_foreground[y][x]:
                     continue
                 
-                # Get the detail level for this cell
-                detail_level = cell_detail_levels[y][x]
-                
-                # Adaptive skipping based on detail level - areas with more detail have more thumbnails
-                local_skip_probability = SKIP_PROBABILITY * (1.0 - detail_level * 0.7)
-                if random.random() < local_skip_probability:
-                    continue
+                # No skipping for dense coverage (SKIP_PROBABILITY = 0.0)
                     
                 # Get the average color
                 avg_color = cell_colors[y][x]
                 
-                # Skip very bright cells
+                # Skip very bright cells (keep this for background filtering)
                 brightness = np.mean(avg_color)
                 if brightness > BRIGHTNESS_THRESHOLD:
                     continue
                     
-                # Find the best match with more weight on color accuracy in detailed areas
-                best_match = find_best_match(avg_color, thumbnails, detail_level)
+                # Find the best match (simplified function)
+                best_match = find_best_match(avg_color, thumbnails)
                 if not best_match:
                     continue
                     
-                # Calculate the high-resolution position
-                hi_res_x = int(x * CELL_SIZE[0] * scale_factor + 
-                              (CELL_SIZE[0] * scale_factor - INTERNAL_THUMBNAIL_SIZE[0]) // 2)
-                hi_res_y = int(y * CELL_SIZE[1] * scale_factor + 
-                              (CELL_SIZE[1] * scale_factor - INTERNAL_THUMBNAIL_SIZE[1]) // 2)
-                
-                # Calculate the maximum random offset in pixels based on cell size and detail level
-                # Less randomness in high-detail areas for better precision
-                randomness_factor = POSITION_RANDOMNESS * (1.0 - detail_level * 0.7)
-                max_offset_x = int(CELL_SIZE[0] * scale_factor * randomness_factor)
-                max_offset_y = int(CELL_SIZE[1] * scale_factor * randomness_factor)
-                
-                # Generate random offsets
-                rand_offset_x = random.randint(-max_offset_x, max_offset_x)
-                rand_offset_y = random.randint(-max_offset_y, max_offset_y)
-                
-                # Apply the random offsets
-                hi_res_x += rand_offset_x
-                hi_res_y += rand_offset_y
+                # Calculate the high-resolution position (no randomness for uniform grid)
+                hi_res_x = int(x * CELL_SIZE[0] * scale_factor)
+                hi_res_y = int(y * CELL_SIZE[1] * scale_factor)
 
                 # Ensure the thumbnail stays within the mosaic bounds
                 hi_res_x = max(0, min(hi_res_x, hi_res_width - INTERNAL_THUMBNAIL_SIZE[0]))
                 hi_res_y = max(0, min(hi_res_y, hi_res_height - INTERNAL_THUMBNAIL_SIZE[1]))
                 
-                # Determine thumbnail size based on detail level if enabled
-                if USE_VARIABLE_SIZES:
-                    # Areas with high detail get smaller thumbnails
-                    thumbnail_scale = max(MIN_THUMBNAIL_SCALE, 1.0 - (detail_level * 0.5))
-                    # Random variation for natural look
-                    if random.random() < 0.3:  # 30% chance for size variation
-                        thumbnail_scale = thumbnail_scale * random.uniform(0.9, 1.1)
-                        
-                    # Calculate new dimensions
-                    new_width = int(INTERNAL_THUMBNAIL_SIZE[0] * thumbnail_scale)
-                    new_height = int(INTERNAL_THUMBNAIL_SIZE[1] * thumbnail_scale)
-                    
-                    # Resize the thumbnail
-                    thumbnail_to_paste = best_match['image'].resize((new_width, new_height), Image.LANCZOS)
-                else:
-                    thumbnail_to_paste = best_match['image']
+                # Use uniform thumbnail size (no variable sizes)
+                thumbnail_to_paste = best_match['image']
                 
-                # Apply rotation if edge alignment is enabled and we have edge data
-                if EDGE_ALIGNMENT and canny_edges is not None and detail_level > 0.3:
-                    try:
-                        # Get cell center in original image coordinates
-                        center_x = cell_x + CELL_SIZE[0] // 2
-                        center_y = cell_y + CELL_SIZE[1] // 2
-                        
-                        # Get edge orientation at this point
-                        rotation_angle = get_edge_orientation(canny_edges, center_x, center_y)
-                        
-                        # Apply rotation if we got a valid angle
-                        if rotation_angle != 0:
-                            thumbnail_to_paste = thumbnail_to_paste.rotate(rotation_angle, resample=Image.BILINEAR, expand=False)
-                    except Exception as e:
-                        print(f"Error applying edge-based rotation: {e}")
-                elif random.random() < 0.2:  # Random rotation in 20% of cases for variety
-                    rotation_angle = random.choice([0, 90, 180, 270])
-                    thumbnail_to_paste = thumbnail_to_paste.rotate(rotation_angle, resample=Image.BILINEAR, expand=False)
+                # No rotation for uniform appearance and better performance
                 
                 # Place the high-resolution thumbnail
                 mosaic.paste(thumbnail_to_paste, (hi_res_x, hi_res_y))
                 filled_cells += 1
                 
                 # Periodic status updates
-                if filled_cells % 100 == 0:
+                if filled_cells % 200 == 0:
                     print(f"Placed {filled_cells} thumbnails so far...")
         
         print(f"High-resolution mosaic created with {filled_cells}/{total_cells} cells filled")
