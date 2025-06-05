@@ -229,126 +229,173 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
     """
     Detect foreground vs background in the image.
     Returns a binary mask where True = foreground, False = background.
-    Now improved to include faces while excluding actual background.
+    Now much more inclusive of bright areas like faces.
     """
     # Convert to grayscale for processing
     gray = image.convert('L')
     gray_array = np.array(gray)
     
+    # Get the RGB array for color-based detection
+    rgb_array = np.array(image)
+    
     if threshold_method == 'adaptive' and SKIMAGE_AVAILABLE:
         try:
-            # Use Otsu's method but make it more inclusive for faces
+            # Use Otsu's method but make it much more inclusive for faces and bright subjects
             threshold = threshold_otsu(gray_array)
             
-            # Instead of just using pixels darker than threshold,
-            # we'll be more inclusive and use a lower threshold
-            # This helps include faces which might be close to the Otsu threshold
-            adjusted_threshold = threshold + 15  # Slightly less aggressive than +20
+            print(f"Otsu threshold: {threshold}")
             
-            # Create initial mask with the adjusted threshold
-            mask = gray_array < adjusted_threshold
+            # Create multiple masks for different approaches
             
-            # Use connected components to include bright areas (faces) that are connected to dark areas
-            from skimage.measure import label, regionprops
+            # 1. Traditional dark areas (hair, clothing, shadows)
+            dark_mask = gray_array < (threshold + 20)  # More inclusive than before
+            
+            # 2. Very inclusive mask that captures most of the subject including bright faces
+            # Use a much higher threshold to include faces
+            bright_inclusive_threshold = min(250, threshold + 80)  # Much more generous
+            bright_mask = gray_array < bright_inclusive_threshold
+            
+            # 3. Skin tone detection for faces
+            # Detect flesh/skin tones which are typically foreground
+            skin_mask = np.zeros_like(gray_array, dtype=bool)
+            
+            # Simple skin tone detection in RGB space
+            r, g, b = rgb_array[:,:,0], rgb_array[:,:,1], rgb_array[:,:,2]
+            
+            # Skin tone conditions (broad range to catch different lighting)
+            skin_condition1 = (r > 95) & (g > 40) & (b > 20) & \
+                             (r > g) & (r > b) & \
+                             (np.abs(r.astype(int) - g.astype(int)) > 15)
+            
+            # Alternative skin detection for different lighting
+            skin_condition2 = (r > 80) & (g > 50) & (b > 30) & \
+                             (r > b) & (g > b) & \
+                             ((r - b) > 10)
+            
+            # Combine skin conditions
+            skin_mask = skin_condition1 | skin_condition2
+            
+            # 4. Edge-based subject detection
             from skimage.morphology import binary_closing, binary_opening, disk, binary_dilation, binary_erosion
+            from skimage.filters import sobel
             
-            # First, get a very conservative mask of definitely foreground areas (dark areas)
-            conservative_mask = gray_array < (threshold - 5)  # Less aggressive than -10
+            # Use Sobel edge detection
+            edges = sobel(gray_array)
+            edge_threshold = np.percentile(edges, 70)  # Lower percentile to catch more edges
+            strong_edges = edges > edge_threshold
             
-            # Only minimal dilation to connect very close regions
-            conservative_mask = binary_dilation(conservative_mask, disk(8))  # Reduced from 15
+            # Dilate edges to create regions
+            edge_regions = binary_dilation(strong_edges, disk(15))  # Larger dilation for better coverage
             
-            # Now create a more liberal mask that might include faces
-            liberal_threshold = min(230, threshold + 40)  # More conservative: 230 instead of 240, +40 instead of +60
-            liberal_mask = gray_array < liberal_threshold
+            # 5. Center-weighted mask (subjects are often in center)
+            h, w = gray_array.shape
+            y_center, x_center = h // 2, w // 2
+            y_coords, x_coords = np.ogrid[:h, :w]
             
-            # Combine: keep liberal areas that are connected to conservative areas
-            # Use smaller dilation to avoid halo effect
-            combined_mask = conservative_mask | (liberal_mask & binary_dilation(conservative_mask, disk(12)))  # Reduced from 25
+            # Distance from center
+            center_distance = np.sqrt((y_coords - y_center)**2 + (x_coords - x_center)**2)
+            max_distance = np.sqrt(h**2 + w**2) / 2
+            center_weight = 1.0 - (center_distance / max_distance)
+            
+            # Areas close to center are more likely to be foreground
+            center_mask = center_weight > 0.3  # Include central 70% of image
+            
+            # Combine all approaches
+            # Start with skin areas (high confidence for faces)
+            combined_mask = skin_mask.copy()
+            
+            # Add dark areas (traditional foreground)
+            combined_mask = combined_mask | dark_mask
+            
+            # Add bright areas that are near edges (subject boundaries) and in center
+            bright_subject_mask = bright_mask & edge_regions & center_mask
+            combined_mask = combined_mask | bright_subject_mask
+            
+            # Add any bright areas that are surrounded by other foreground areas
+            # This helps capture bright faces surrounded by hair/clothing
+            dark_dilated = binary_dilation(dark_mask, disk(20))
+            bright_surrounded = bright_mask & dark_dilated
+            combined_mask = combined_mask | bright_surrounded
             
             # Clean up the mask
-            mask = binary_closing(combined_mask, disk(5))  # Reduced from 8
-            mask = binary_opening(mask, disk(3))  # Reduced from 4
+            mask = binary_closing(combined_mask, disk(8))
+            mask = binary_opening(mask, disk(3))
             
+            # Much gentler erosion to preserve facial areas
+            mask = binary_erosion(mask, disk(2))  # Reduced from 4
             
-            # Additional aggressive erosion to eliminate halo effect
-            mask = binary_erosion(mask, disk(4))  # More aggressive erosion to remove aura
+            print(f"Using enhanced subject-inclusive detection. Bright threshold: {bright_inclusive_threshold}")
+            print(f"Skin pixels detected: {np.sum(skin_mask)}")
+            print(f"Total foreground pixels: {np.sum(mask)}")
             
-            print(f"Using improved Otsu thresholding. Conservative threshold: {threshold-5}, Liberal threshold: {liberal_threshold}")
             return mask
             
         except Exception as e:
-            print(f"Improved Otsu thresholding failed: {e}, falling back to enhanced method")
+            print(f"Enhanced subject detection failed: {e}, falling back to simple method")
     
-    # Enhanced fallback method that's more face-friendly
-    print("Using enhanced adaptive brightness-based foreground detection")
+    # Enhanced fallback method that's very inclusive of faces
+    print("Using enhanced face-inclusive brightness-based foreground detection")
     
     # Calculate multiple threshold approaches and combine them
-    from scipy.ndimage import uniform_filter, gaussian_filter
+    from scipy.ndimage import uniform_filter, gaussian_filter, binary_dilation, binary_closing, binary_opening, binary_erosion
     
-    # Method 1: Local adaptive thresholding (less aggressive)
-    local_avg = uniform_filter(gray_array.astype(float), size=25)  # Reduced from 30
-    adaptive_mask1 = gray_array < (local_avg - 20)  # More conservative than -15
+    # Get RGB array for color-based detection
+    r, g, b = rgb_array[:,:,0], rgb_array[:,:,1], rgb_array[:,:,2]
     
-    # Method 2: Global thresholding with face-friendly threshold
-    global_threshold = 210  # More conservative than 220
+    # 1. Very generous global thresholding
+    global_threshold = 240  # Much higher to include bright faces
     global_mask = gray_array < global_threshold
     
-    # Method 3: Edge-based detection to find object boundaries
-    # Use a gradient-based approach to find edges
+    # 2. Skin tone detection (same as above)
+    skin_condition1 = (r > 95) & (g > 40) & (b > 20) & \
+                     (r > g) & (r > b) & \
+                     (np.abs(r.astype(int) - g.astype(int)) > 15)
+    
+    skin_condition2 = (r > 80) & (g > 50) & (b > 30) & \
+                     (r > b) & (g > b) & \
+                     ((r - b) > 10)
+    
+    skin_mask = skin_condition1 | skin_condition2
+    
+    # 3. Edge-based detection
     grad_x = np.gradient(gray_array.astype(float), axis=1)
     grad_y = np.gradient(gray_array.astype(float), axis=0)
     gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
     
-    # Areas with high gradients are likely object boundaries
-    # Be more selective about edges
-    edge_mask = gradient_magnitude > np.percentile(gradient_magnitude, 80)  # More selective: 80th percentile instead of 75th
+    edge_mask = gradient_magnitude > np.percentile(gradient_magnitude, 70)  # Lower threshold
+    edge_dilated = binary_dilation(edge_mask, structure=np.ones((15, 15)))  # Larger dilation
     
-    # Use scipy for morphological operations if skimage not available
-    from scipy.ndimage import binary_dilation, binary_closing, binary_opening, binary_erosion
+    # 4. Local adaptive thresholding (more generous)
+    local_avg = uniform_filter(gray_array.astype(float), size=30)
+    adaptive_mask = gray_array < (local_avg + 10)  # Changed from minus to plus!
     
-    # Much smaller dilation to avoid halo effect
-    edge_dilated = binary_dilation(edge_mask, structure=np.ones((10, 10)))  # Reduced from (20, 20)
+    # 5. Center weighting
+    h, w = gray_array.shape
+    y_center, x_center = h // 2, w // 2
+    y_coords, x_coords = np.ogrid[:h, :w]
+    center_distance = np.sqrt((y_coords - y_center)**2 + (x_coords - x_center)**2)
+    max_distance = np.sqrt(h**2 + w**2) / 2
+    center_weight = 1.0 - (center_distance / max_distance)
+    center_mask = center_weight > 0.2  # Very inclusive of central areas
     
-    # Combine all methods more conservatively
-    # Start with the most conservative (adaptive) and add others carefully
-    combined_mask = adaptive_mask1.copy()
+    # Combine all methods very inclusively
+    combined_mask = skin_mask.copy()  # Start with skin
+    combined_mask = combined_mask | (global_mask & center_mask)  # Add bright areas in center
+    combined_mask = combined_mask | (adaptive_mask & edge_dilated)  # Add areas near edges
     
-    # Only add global areas that are also near edges
-    combined_mask = combined_mask | (global_mask & edge_dilated)
+    # Add traditional dark areas but only if they're not tiny isolated spots
+    dark_mask = gray_array < 180
+    dark_cleaned = binary_opening(dark_mask, structure=np.ones((5, 5)))
+    combined_mask = combined_mask | dark_cleaned
     
-    # Add moderately dark areas only if they're very close to edges
-    moderate_mask = gray_array < 170  # More conservative than 180
-    # Use smaller dilation for moderate areas
-    small_edge_dilated = binary_dilation(edge_mask, structure=np.ones((6, 6)))
-    combined_mask = combined_mask | (moderate_mask & small_edge_dilated)
+    # Final cleanup - very gentle
+    combined_mask = binary_closing(combined_mask, structure=np.ones((8, 8)))
+    combined_mask = binary_opening(combined_mask, structure=np.ones((3, 3)))
     
-    # Clean up the mask more conservatively
-    combined_mask = binary_closing(combined_mask, structure=np.ones((8, 8)))  # Reduced from (10, 10)
-    combined_mask = binary_opening(combined_mask, structure=np.ones((4, 4)))  # Reduced from (5, 5)
+    # Minimal erosion to preserve facial features
+    combined_mask = binary_erosion(combined_mask, structure=np.ones((2, 2)))
     
-    # IMPORTANT: Add erosion to trim back the edges and remove halo
-    combined_mask = binary_erosion(combined_mask, structure=np.ones((3, 3)))  # Trim back edges
-    
-    # Additional aggressive erosion to eliminate halo effect
-    combined_mask = binary_erosion(combined_mask, structure=np.ones((5, 5)))  # More aggressive erosion to remove aura
-    
-    # Final step: remove very small isolated regions (noise)
-    # Use a simple size filter
-    if SKIMAGE_AVAILABLE:
-        try:
-            from skimage.measure import label, regionprops
-            labeled = label(combined_mask)
-            
-            # Remove small regions
-            min_size = gray_array.size // 400  # Slightly larger minimum size (400 instead of 500)
-            for region in regionprops(labeled):
-                if region.area < min_size:
-                    combined_mask[labeled == region.label] = False
-        except:
-            pass
-    
-    print(f"Enhanced detection complete. Using conservative edge trimming to avoid halo.")
+    print(f"Enhanced face-inclusive detection complete. Foreground pixels: {np.sum(combined_mask)}/{combined_mask.size}")
     return combined_mask
 
 def download_single_image(key, bucket=S3_BUCKET):
@@ -768,7 +815,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='capture_20250502_131625.jpg', 
+    parser.add_argument('--image', type=str, default='image (1)-removebg-preview.jpg', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')
