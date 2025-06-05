@@ -53,7 +53,7 @@ CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
 THUMBNAIL_LIMIT = 3000  # Reduced from 8000 to optimize memory and file size
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
-FOREGROUND_THRESHOLD = 0.08  # Sensitivity to foreground detection
+FOREGROUND_THRESHOLD = 0.03  # More sensitive to include faces (lowered from 0.08)
 POSITION_RANDOMNESS = 0.05  # Very low randomness for precision
 DETAIL_SENSITIVITY = 1.0  # Maximum detail sensitivity
 USE_VARIABLE_SIZES = True  # Use variable thumbnail sizes for better detail
@@ -234,6 +234,7 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
     """
     Detect foreground vs background in the image.
     Returns a binary mask where True = foreground, False = background.
+    Now improved to include faces while excluding actual background.
     """
     # Convert to grayscale for processing
     gray = image.convert('L')
@@ -241,40 +242,106 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
     
     if threshold_method == 'adaptive' and SKIMAGE_AVAILABLE:
         try:
-            # Use Otsu's method for automatic thresholding
+            # Use Otsu's method but make it more inclusive for faces
             threshold = threshold_otsu(gray_array)
-            # Invert because we assume dark subjects on light backgrounds
-            mask = gray_array < threshold
             
-            # Apply morphological operations to clean up the mask
-            from skimage.morphology import binary_closing, binary_opening, disk
-            mask = binary_closing(mask, disk(5))
-            mask = binary_opening(mask, disk(3))
+            # Instead of just using pixels darker than threshold,
+            # we'll be more inclusive and use a lower threshold
+            # This helps include faces which might be close to the Otsu threshold
+            adjusted_threshold = threshold + 20  # More inclusive threshold
             
-            print(f"Using Otsu thresholding with threshold: {threshold}")
+            # Create initial mask with the adjusted threshold
+            mask = gray_array < adjusted_threshold
+            
+            # Use connected components to include bright areas (faces) that are connected to dark areas
+            from skimage.measure import label, regionprops
+            from skimage.morphology import binary_closing, binary_opening, disk, binary_dilation
+            
+            # First, get a very conservative mask of definitely foreground areas (dark areas)
+            conservative_mask = gray_array < (threshold - 10)
+            
+            # Dilate the conservative mask to connect nearby regions
+            conservative_mask = binary_dilation(conservative_mask, disk(15))
+            
+            # Now create a more liberal mask that might include faces
+            liberal_threshold = min(240, threshold + 60)  # Don't go above 240 to exclude pure white
+            liberal_mask = gray_array < liberal_threshold
+            
+            # Combine: keep liberal areas that are connected to conservative areas
+            combined_mask = conservative_mask | (liberal_mask & binary_dilation(conservative_mask, disk(25)))
+            
+            # Clean up the mask
+            mask = binary_closing(combined_mask, disk(8))
+            mask = binary_opening(mask, disk(4))
+            
+            print(f"Using improved Otsu thresholding. Conservative threshold: {threshold-10}, Liberal threshold: {liberal_threshold}")
             return mask
             
         except Exception as e:
-            print(f"Otsu thresholding failed: {e}, falling back to simple method")
+            print(f"Improved Otsu thresholding failed: {e}, falling back to enhanced method")
     
-    # Fallback method: simple brightness-based thresholding
-    # Assume background is bright (white/light colored)
-    brightness_threshold = 200  # Adjust this value based on your images
+    # Enhanced fallback method that's more face-friendly
+    print("Using enhanced adaptive brightness-based foreground detection")
     
-    # Calculate local average to handle lighting variations
-    from scipy.ndimage import uniform_filter
-    local_avg = uniform_filter(gray_array.astype(float), size=20)
+    # Calculate multiple threshold approaches and combine them
+    from scipy.ndimage import uniform_filter, gaussian_filter
     
-    # Create mask where pixels are significantly darker than local average
-    mask = gray_array < (local_avg - 30)
+    # Method 1: Local adaptive thresholding (less aggressive)
+    local_avg = uniform_filter(gray_array.astype(float), size=30)
+    adaptive_mask1 = gray_array < (local_avg - 15)  # Less aggressive than -30
     
-    # Remove small noise
-    from scipy.ndimage import binary_opening, binary_closing
-    mask = binary_opening(mask, structure=np.ones((3, 3)))
-    mask = binary_closing(mask, structure=np.ones((5, 5)))
+    # Method 2: Global thresholding with face-friendly threshold
+    global_threshold = 220  # More inclusive than 200
+    global_mask = gray_array < global_threshold
     
-    print("Using adaptive brightness-based foreground detection")
-    return mask
+    # Method 3: Edge-based detection to find object boundaries
+    # Use a gradient-based approach to find edges
+    grad_x = np.gradient(gray_array.astype(float), axis=1)
+    grad_y = np.gradient(gray_array.astype(float), axis=0)
+    gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+    
+    # Areas with high gradients are likely object boundaries
+    # Dilate these to include the objects themselves
+    edge_mask = gradient_magnitude > np.percentile(gradient_magnitude, 75)
+    
+    # Use scipy for morphological operations if skimage not available
+    from scipy.ndimage import binary_dilation, binary_closing, binary_opening
+    
+    # Dilate edges to include the objects
+    edge_dilated = binary_dilation(edge_mask, structure=np.ones((20, 20)))
+    
+    # Combine all methods
+    # Start with the most conservative (global) and add others
+    combined_mask = global_mask.copy()
+    
+    # Add areas that are detected by adaptive method AND are near edges
+    combined_mask = combined_mask | (adaptive_mask1 & edge_dilated)
+    
+    # Add areas that are moderately dark (to catch faces)
+    moderate_mask = gray_array < 180  # Even more inclusive for faces
+    combined_mask = combined_mask | (moderate_mask & edge_dilated)
+    
+    # Clean up the mask
+    combined_mask = binary_closing(combined_mask, structure=np.ones((10, 10)))
+    combined_mask = binary_opening(combined_mask, structure=np.ones((5, 5)))
+    
+    # Final step: remove very small isolated regions (noise)
+    # Use a simple size filter
+    if SKIMAGE_AVAILABLE:
+        try:
+            from skimage.measure import label, regionprops
+            labeled = label(combined_mask)
+            
+            # Remove small regions
+            min_size = gray_array.size // 500  # Minimum size relative to image
+            for region in regionprops(labeled):
+                if region.area < min_size:
+                    combined_mask[labeled == region.label] = False
+        except:
+            pass
+    
+    print(f"Enhanced detection complete. Using multiple threshold methods.")
+    return combined_mask
 
 def download_single_image(key, bucket=S3_BUCKET):
     """Download and process a single image from S3."""
