@@ -43,20 +43,20 @@ s3_client = boto3.client(
 )
 
 # Mosaic configuration - you can adjust these parameters to experiment
-THUMBNAIL_SIZE = (2, 3)  # Size for display/layout
+THUMBNAIL_SIZE = (1, 1)  # Size for display/layout
 INTERNAL_THUMBNAIL_SIZE = (250, 250)  # Resolution for zoom detail
-CELL_SIZE = (2, 2)  # Spacing between thumbnails (controls density)
+CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density)
 CONTRAST_FACTOR = 1  # Contrast enhancement for better edge detection
-BRIGHTNESS_THRESHOLD = 200  # Threshold for skipping very bright areas
+BRIGHTNESS_THRESHOLD = 250  # Threshold for skipping very bright areas
 THUMBNAIL_LIMIT = 4000  # Number of thumbnails to use (adjust based on memory)
-SKIP_PROBABILITY = 0.005  # Lower = more thumbnails used in mosaic
+SKIP_PROBABILITY = 0.000  # Lower = more thumbnails used in mosaic
 FOREGROUND_THRESHOLD = 0.08  # Sensitivity to foreground detection
-POSITION_RANDOMNESS = 0.15  # Randomness in thumbnail positions
-DETAIL_SENSITIVITY = 0.8  # Sensitivity to image details (0-1)
+POSITION_RANDOMNESS = 0.0  # Randomness in thumbnail positions
+DETAIL_SENSITIVITY = 1  # Sensitivity to image details (0-1)
 USE_VARIABLE_SIZES = True  # Whether to use variable thumbnail sizes
 EDGE_ALIGNMENT = True  # Whether to align thumbnails with edges
 MIN_THUMBNAIL_SCALE = 0.1  # Minimum scale factor for thumbnails in detailed areas
-MAX_THUMBNAIL_SCALE = 1.2  # Maximum scale factor for thumbnails
+MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -627,7 +627,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='capture_20250502_131625.jpg', 
+    parser.add_argument('--image', type=str, default='image.png', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')
