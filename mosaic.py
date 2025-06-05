@@ -45,9 +45,9 @@ s3_client = boto3.client(
 )
 
 # Mosaic configuration - optimized for seamless detailed appearance
-THUMBNAIL_SIZE = (2, 2)  # Very small for seamless blending
+THUMBNAIL_SIZE = (1, 1)  # Very small for seamless blending
 INTERNAL_THUMBNAIL_SIZE = (64, 64)  # Higher resolution for better detail
-CELL_SIZE = (2, 2)  # Match thumbnail size for dense, seamless coverage
+CELL_SIZE = (1, 1)  # Match thumbnail size for dense, seamless coverage
 CONTRAST_FACTOR = 1.2  # Slight contrast boost for better feature definition
 BRIGHTNESS_THRESHOLD = 240  # Slightly lower to include more detail areas
 THUMBNAIL_LIMIT = 3000  # More thumbnails for better variety
@@ -55,9 +55,9 @@ SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
 FOREGROUND_THRESHOLD = 0.03  # More sensitive to capture fine details
 POSITION_RANDOMNESS = 0.0  # Perfect grid alignment
 DETAIL_SENSITIVITY = 0.5  # Not used but kept for compatibility
-USE_VARIABLE_SIZES = False  # Uniform sizes for seamless appearance
+USE_VARIABLE_SIZES = True  # Uniform sizes for seamless appearance
 EDGE_ALIGNMENT = False  # Disabled for performance
-MIN_THUMBNAIL_SCALE = 0.8  # Not used when variable sizes disabled
+MIN_THUMBNAIL_SCALE = 0.1  # Not used when variable sizes disabled
 MAX_THUMBNAIL_SCALE = 1.0  # Not used when variable sizes disabled
 
 def get_average_color(img):
@@ -424,15 +424,15 @@ def create_mosaic(img, thumbnails):
         white_background = Image.new('RGB', WHITE_BACKGROUND_SIZE, (245, 245, 245))
          
         # Calculate the new dimensions that fit within the white background
-        new_width = math.floor(rotated_mosaic.width / 2)
-        new_height = math.floor(rotated_mosaic.height / 2)
+        new_width = math.floor(rotated_mosaic.width / 1)
+        new_height = math.floor(rotated_mosaic.height / 1)
          
         # Resize the mosaic to fit within the white background
         resized_mosaic = rotated_mosaic.resize((new_width, new_height), Image.LANCZOS)
          
         # Calculate the position to center the mosaic within the white background
-        x = (WHITE_BACKGROUND_SIZE[0] - new_width) // 2
-        y = (WHITE_BACKGROUND_SIZE[1] - new_height) // 2
+        x = (WHITE_BACKGROUND_SIZE[0] - new_width) // 1
+        y = (WHITE_BACKGROUND_SIZE[1] - new_height) // 1
  
         # Paste the resized mosaic onto the white background
         white_background.paste(resized_mosaic, (x, y))
