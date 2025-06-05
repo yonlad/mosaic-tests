@@ -111,34 +111,49 @@ def get_edge_orientation(edges, x, y, window_size=15):
 def find_best_match(target_color, thumbnails, cell_detail=0.0):
     """Find the thumbnail with the closest average color to the target color.
     
-    Enhanced version for better color accuracy with tiny thumbnails.
+    Enhanced version for better color accuracy with facial features.
     """
     min_distance = float('inf')
     best_match = None
     
     target_color = np.array(target_color).astype(float)
     
-    # Use perceptually weighted RGB distance for better color matching
-    # These weights approximate human color perception
-    weights = np.array([0.299, 0.587, 0.114])  # Standard luminance weights
+    # Use LAB color space if available for better perceptual accuracy
+    if SKIMAGE_AVAILABLE:
+        try:
+            # Convert to LAB color space for perceptual accuracy
+            target_rgb = target_color.reshape(1, 1, 3) / 255.0
+            target_lab = color.rgb2lab(target_rgb).reshape(3)
+            use_lab = True
+        except:
+            use_lab = False
+    else:
+        use_lab = False
     
-    # For very small thumbnails, we need more precise color matching
-    # Add a small amount of randomness to avoid repetitive patterns
     candidates = []
     
     for thumbnail in thumbnails:
-        # Calculate weighted Euclidean distance in RGB space
-        diff = target_color - thumbnail['avg_color']
-        distance = np.sqrt(np.sum((diff * weights) ** 2))
+        if use_lab:
+            # Use LAB color space for better skin tone matching
+            thumbnail_rgb = thumbnail['avg_color'].reshape(1, 1, 3) / 255.0
+            thumbnail_lab = color.rgb2lab(thumbnail_rgb).reshape(3)
+            # Calculate Delta E (perceptual color difference)
+            distance = np.sqrt(np.sum((target_lab - thumbnail_lab) ** 2))
+        else:
+            # Fallback to weighted RGB for skin tone sensitivity
+            # Weights optimized for facial features (more sensitive to red/yellow tones)
+            weights = np.array([0.35, 0.55, 0.10])  # Enhanced red/green sensitivity for skin
+            diff = target_color - thumbnail['avg_color']
+            distance = np.sqrt(np.sum((diff * weights) ** 2))
         
         candidates.append((distance, thumbnail))
     
-    # Sort by distance and pick from the best matches
+    # Sort by distance and pick the best match
     candidates.sort(key=lambda x: x[0])
     
-    # For tiny thumbnails, occasionally pick from top 3 matches to avoid repetition
-    if len(candidates) >= 3 and random.random() < 0.15:  # 15% chance for variety
-        best_match = candidates[random.randint(0, 2)][1]
+    # For facial detail preservation, use more precise matching (less randomness)
+    if len(candidates) >= 3 and random.random() < 0.08:  # Reduced to 8% for better precision
+        best_match = candidates[random.randint(0, 1)][1]  # Only pick from top 2
     else:
         best_match = candidates[0][1]
     
@@ -308,7 +323,7 @@ def create_mosaic(img, thumbnails):
         enhanced_array = np.array(enhanced_gray)
         edges_array = np.array(edges)
         
-        # Simplified foreground detection using Otsu's method
+        # Simplified foreground detection using Otsu's method with facial enhancement
         try:
             if threshold_otsu:
                 threshold = threshold_otsu(enhanced_array)
@@ -319,23 +334,37 @@ def create_mosaic(img, thumbnails):
             # Fallback if method fails
             threshold = np.mean(enhanced_array) * 0.8
         
-        # Create foreground mask - invert so darker areas (typically subject) are True
-        foreground_mask = enhanced_array < threshold
+        # Create foreground mask - make it more inclusive for faces
+        # Use a more liberal threshold for faces (which tend to be mid-tone)
+        face_threshold = threshold + 20  # More inclusive for facial tones
+        foreground_mask = enhanced_array < face_threshold
         
-        # Apply basic morphological operations to clean up the mask
-        foreground_mask = ndimage.binary_closing(foreground_mask, structure=np.ones((5, 5)))
-        foreground_mask = ndimage.binary_opening(foreground_mask, structure=np.ones((3, 3)))
-        foreground_mask = ndimage.binary_dilation(foreground_mask, structure=np.ones((7, 7)))
+        # Add edge-based detection to capture facial features
+        edge_strength = np.array(edges) / 255.0
+        edge_mask = edge_strength > 0.1  # Areas with moderate edges (facial features)
         
-        print(f"Created simplified foreground mask for subject detection")
+        # Combine intensity and edge-based detection
+        # Include areas that are either below threshold OR have significant edges
+        combined_mask = foreground_mask | edge_mask
+        
+        # Apply morphological operations to clean up but preserve facial details
+        combined_mask = ndimage.binary_closing(combined_mask, structure=np.ones((3, 3)))  # Smaller for detail preservation
+        combined_mask = ndimage.binary_opening(combined_mask, structure=np.ones((2, 2)))   # Smaller to keep details
+        
+        # Gentle dilation to ensure facial areas are captured
+        foreground_mask = ndimage.binary_dilation(combined_mask, structure=np.ones((5, 5)))
+        
+        print(f"Enhanced foreground detection with facial feature preservation")
         
         # Process grid by extracting cell average colors - use ORIGINAL image for colors
         cell_colors = []
         cell_is_foreground = []
+        cell_detail_levels = []
         
         for y in range(n_rows):
             row_colors = []
             row_foreground = []
+            row_details = []
             for x in range(n_cols):
                 cell_x = x * CELL_SIZE[0]
                 cell_y = y * CELL_SIZE[1]
@@ -349,9 +378,18 @@ def create_mosaic(img, thumbnails):
                 is_foreground = np.mean(cell_mask) > FOREGROUND_THRESHOLD
                 row_foreground.append(is_foreground)
                 
+                # Calculate detail level for facial feature preservation
+                if is_foreground:
+                    cell_edges = edges_array[cell_y:cell_y + CELL_SIZE[1], cell_x:cell_x + CELL_SIZE[0]]
+                    detail_level = np.mean(cell_edges) / 255.0
+                else:
+                    detail_level = 0.0
+                row_details.append(detail_level)
+                
                 del cell
             cell_colors.append(row_colors)
             cell_is_foreground.append(row_foreground)
+            cell_detail_levels.append(row_details)
         
         # Release the source images from memory
         del enhanced_img
@@ -369,16 +407,17 @@ def create_mosaic(img, thumbnails):
                 
                 # No skipping for dense coverage (SKIP_PROBABILITY = 0.0)
                     
-                # Get the average color
+                # Get the average color and detail level
                 avg_color = cell_colors[y][x]
+                detail_level = cell_detail_levels[y][x]
                 
                 # Skip very bright cells (keep this for background filtering)
                 brightness = np.mean(avg_color)
                 if brightness > BRIGHTNESS_THRESHOLD:
                     continue
                     
-                # Find the best match (simplified function)
-                best_match = find_best_match(avg_color, thumbnails)
+                # Find the best match with detail information for better facial matching
+                best_match = find_best_match(avg_color, thumbnails, detail_level)
                 if not best_match:
                     continue
                     
@@ -390,10 +429,22 @@ def create_mosaic(img, thumbnails):
                 hi_res_x = max(0, min(hi_res_x, hi_res_width - INTERNAL_THUMBNAIL_SIZE[0]))
                 hi_res_y = max(0, min(hi_res_y, hi_res_height - INTERNAL_THUMBNAIL_SIZE[1]))
                 
-                # Use uniform thumbnail size (no variable sizes)
-                thumbnail_to_paste = best_match['image']
-                
-                # No rotation for uniform appearance and better performance
+                # Use detail-aware thumbnail sizing for facial features
+                if detail_level > 0.3:  # High detail areas (facial features)
+                    # Use smaller thumbnails for better detail preservation
+                    scale = max(0.7, 1.0 - (detail_level * 0.4))  # 70% to 100% size
+                    new_width = int(INTERNAL_THUMBNAIL_SIZE[0] * scale)
+                    new_height = int(INTERNAL_THUMBNAIL_SIZE[1] * scale)
+                    thumbnail_to_paste = best_match['image'].resize((new_width, new_height), Image.LANCZOS)
+                    
+                    # Center the smaller thumbnail in the cell
+                    offset_x = (INTERNAL_THUMBNAIL_SIZE[0] - new_width) // 2
+                    offset_y = (INTERNAL_THUMBNAIL_SIZE[1] - new_height) // 2
+                    hi_res_x += offset_x
+                    hi_res_y += offset_y
+                else:
+                    # Use full-size thumbnails for less detailed areas
+                    thumbnail_to_paste = best_match['image']
                 
                 # Place the high-resolution thumbnail
                 mosaic.paste(thumbnail_to_paste, (hi_res_x, hi_res_y))
