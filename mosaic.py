@@ -47,18 +47,18 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (1, 1)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (120, 120)  # Optimized for 300 DPI printing while reducing file size
+INTERNAL_THUMBNAIL_SIZE = (60, 60)  # Much smaller for ultra-photorealistic blending
 CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
-THUMBNAIL_LIMIT = 2500  # Reduced to optimize file size while maintaining quality
+THUMBNAIL_LIMIT = 3500  # Increased for better variety and coverage
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
 FOREGROUND_THRESHOLD = 0.03  # More sensitive to include faces (lowered from 0.08)
-POSITION_RANDOMNESS = 0.05  # Very low randomness for precision
-DETAIL_SENSITIVITY = 1.0  # Maximum detail sensitivity
-USE_VARIABLE_SIZES = True  # Use variable thumbnail sizes for better detail
-EDGE_ALIGNMENT = True  # Align thumbnails with edges for better detail definition
-MIN_THUMBNAIL_SCALE = 0.15  # Slightly larger minimum for better coverage
+POSITION_RANDOMNESS = 0.0  # Zero randomness for perfect grid alignment
+DETAIL_SENSITIVITY = 2.0  # Higher sensitivity for ultra-fine details
+USE_VARIABLE_SIZES = False  # Uniform sizes for consistent photorealistic effect
+EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
+MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
 MAX_CONCURRENT_DOWNLOADS = 20  # Maximum number of concurrent downloads
 
@@ -161,9 +161,8 @@ def find_best_match(target_color, thumbnails, cell_detail=0.0):
     else:
         target_lab = None
     
-    # Weight candidates differently based on detail level
-    # Higher detail cells need more accurate color matching
-    color_weight = 0.7 + 0.3 * cell_detail  # 0.7-1.0 based on detail
+    # For ultra-photorealistic results, prioritize color accuracy over variety
+    color_weight = 0.95  # Very high color accuracy
     texture_weight = 1.0 - color_weight
     
     candidate_thumbnails = []
@@ -193,12 +192,8 @@ def find_best_match(target_color, thumbnails, cell_detail=0.0):
     if candidate_thumbnails:
         # Sort by distance
         candidate_thumbnails.sort(key=lambda x: x[0])
-        # Choose from the top candidates (introducing slight randomness for variety)
-        top_n = max(1, min(5, int(len(candidate_thumbnails) * 0.05)))
-        if top_n > 1 and random.random() < 0.3:  # 30% chance to pick a non-optimal match for variety
-            best_match = random.choice(candidate_thumbnails[:top_n])[1]
-        else:
-            best_match = candidate_thumbnails[0][1]
+        # For ultra-photorealistic results, always choose the best match (no randomness)
+        best_match = candidate_thumbnails[0][1]
     
     return best_match
 
