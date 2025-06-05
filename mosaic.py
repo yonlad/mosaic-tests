@@ -47,11 +47,11 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (1, 1)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (250, 250)  # High resolution for 300 DPI printing quality
+INTERNAL_THUMBNAIL_SIZE = (120, 120)  # Optimized for 300 DPI printing while reducing file size
 CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
-THUMBNAIL_LIMIT = 3000  # Reduced from 8000 to optimize memory and file size
+THUMBNAIL_LIMIT = 2500  # Reduced to optimize file size while maintaining quality
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
 FOREGROUND_THRESHOLD = 0.03  # More sensitive to include faces (lowered from 0.08)
 POSITION_RANDOMNESS = 0.05  # Very low randomness for precision
@@ -248,33 +248,38 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
             # Instead of just using pixels darker than threshold,
             # we'll be more inclusive and use a lower threshold
             # This helps include faces which might be close to the Otsu threshold
-            adjusted_threshold = threshold + 20  # More inclusive threshold
+            adjusted_threshold = threshold + 15  # Slightly less aggressive than +20
             
             # Create initial mask with the adjusted threshold
             mask = gray_array < adjusted_threshold
             
             # Use connected components to include bright areas (faces) that are connected to dark areas
             from skimage.measure import label, regionprops
-            from skimage.morphology import binary_closing, binary_opening, disk, binary_dilation
+            from skimage.morphology import binary_closing, binary_opening, disk, binary_dilation, binary_erosion
             
             # First, get a very conservative mask of definitely foreground areas (dark areas)
-            conservative_mask = gray_array < (threshold - 10)
+            conservative_mask = gray_array < (threshold - 5)  # Less aggressive than -10
             
-            # Dilate the conservative mask to connect nearby regions
-            conservative_mask = binary_dilation(conservative_mask, disk(15))
+            # Only minimal dilation to connect very close regions
+            conservative_mask = binary_dilation(conservative_mask, disk(8))  # Reduced from 15
             
             # Now create a more liberal mask that might include faces
-            liberal_threshold = min(240, threshold + 60)  # Don't go above 240 to exclude pure white
+            liberal_threshold = min(230, threshold + 40)  # More conservative: 230 instead of 240, +40 instead of +60
             liberal_mask = gray_array < liberal_threshold
             
             # Combine: keep liberal areas that are connected to conservative areas
-            combined_mask = conservative_mask | (liberal_mask & binary_dilation(conservative_mask, disk(25)))
+            # Use smaller dilation to avoid halo effect
+            combined_mask = conservative_mask | (liberal_mask & binary_dilation(conservative_mask, disk(12)))  # Reduced from 25
             
             # Clean up the mask
-            mask = binary_closing(combined_mask, disk(8))
-            mask = binary_opening(mask, disk(4))
+            mask = binary_closing(combined_mask, disk(5))  # Reduced from 8
+            mask = binary_opening(mask, disk(3))  # Reduced from 4
             
-            print(f"Using improved Otsu thresholding. Conservative threshold: {threshold-10}, Liberal threshold: {liberal_threshold}")
+            
+            # Additional aggressive erosion to eliminate halo effect
+            mask = binary_erosion(mask, disk(4))  # More aggressive erosion to remove aura
+            
+            print(f"Using improved Otsu thresholding. Conservative threshold: {threshold-5}, Liberal threshold: {liberal_threshold}")
             return mask
             
         except Exception as e:
@@ -287,11 +292,11 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
     from scipy.ndimage import uniform_filter, gaussian_filter
     
     # Method 1: Local adaptive thresholding (less aggressive)
-    local_avg = uniform_filter(gray_array.astype(float), size=30)
-    adaptive_mask1 = gray_array < (local_avg - 15)  # Less aggressive than -30
+    local_avg = uniform_filter(gray_array.astype(float), size=25)  # Reduced from 30
+    adaptive_mask1 = gray_array < (local_avg - 20)  # More conservative than -15
     
     # Method 2: Global thresholding with face-friendly threshold
-    global_threshold = 220  # More inclusive than 200
+    global_threshold = 210  # More conservative than 220
     global_mask = gray_array < global_threshold
     
     # Method 3: Edge-based detection to find object boundaries
@@ -301,29 +306,37 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
     gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
     
     # Areas with high gradients are likely object boundaries
-    # Dilate these to include the objects themselves
-    edge_mask = gradient_magnitude > np.percentile(gradient_magnitude, 75)
+    # Be more selective about edges
+    edge_mask = gradient_magnitude > np.percentile(gradient_magnitude, 80)  # More selective: 80th percentile instead of 75th
     
     # Use scipy for morphological operations if skimage not available
-    from scipy.ndimage import binary_dilation, binary_closing, binary_opening
+    from scipy.ndimage import binary_dilation, binary_closing, binary_opening, binary_erosion
     
-    # Dilate edges to include the objects
-    edge_dilated = binary_dilation(edge_mask, structure=np.ones((20, 20)))
+    # Much smaller dilation to avoid halo effect
+    edge_dilated = binary_dilation(edge_mask, structure=np.ones((10, 10)))  # Reduced from (20, 20)
     
-    # Combine all methods
-    # Start with the most conservative (global) and add others
-    combined_mask = global_mask.copy()
+    # Combine all methods more conservatively
+    # Start with the most conservative (adaptive) and add others carefully
+    combined_mask = adaptive_mask1.copy()
     
-    # Add areas that are detected by adaptive method AND are near edges
-    combined_mask = combined_mask | (adaptive_mask1 & edge_dilated)
+    # Only add global areas that are also near edges
+    combined_mask = combined_mask | (global_mask & edge_dilated)
     
-    # Add areas that are moderately dark (to catch faces)
-    moderate_mask = gray_array < 180  # Even more inclusive for faces
-    combined_mask = combined_mask | (moderate_mask & edge_dilated)
+    # Add moderately dark areas only if they're very close to edges
+    moderate_mask = gray_array < 170  # More conservative than 180
+    # Use smaller dilation for moderate areas
+    small_edge_dilated = binary_dilation(edge_mask, structure=np.ones((6, 6)))
+    combined_mask = combined_mask | (moderate_mask & small_edge_dilated)
     
-    # Clean up the mask
-    combined_mask = binary_closing(combined_mask, structure=np.ones((10, 10)))
-    combined_mask = binary_opening(combined_mask, structure=np.ones((5, 5)))
+    # Clean up the mask more conservatively
+    combined_mask = binary_closing(combined_mask, structure=np.ones((8, 8)))  # Reduced from (10, 10)
+    combined_mask = binary_opening(combined_mask, structure=np.ones((4, 4)))  # Reduced from (5, 5)
+    
+    # IMPORTANT: Add erosion to trim back the edges and remove halo
+    combined_mask = binary_erosion(combined_mask, structure=np.ones((3, 3)))  # Trim back edges
+    
+    # Additional aggressive erosion to eliminate halo effect
+    combined_mask = binary_erosion(combined_mask, structure=np.ones((5, 5)))  # More aggressive erosion to remove aura
     
     # Final step: remove very small isolated regions (noise)
     # Use a simple size filter
@@ -333,14 +346,14 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
             labeled = label(combined_mask)
             
             # Remove small regions
-            min_size = gray_array.size // 500  # Minimum size relative to image
+            min_size = gray_array.size // 400  # Slightly larger minimum size (400 instead of 500)
             for region in regionprops(labeled):
                 if region.area < min_size:
                     combined_mask[labeled == region.label] = False
         except:
             pass
     
-    print(f"Enhanced detection complete. Using multiple threshold methods.")
+    print(f"Enhanced detection complete. Using conservative edge trimming to avoid halo.")
     return combined_mask
 
 def download_single_image(key, bucket=S3_BUCKET):
@@ -467,9 +480,6 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix="selected-images/"):
                 print(f"HSV sorting failed: {e}")
                 # Fallback to RGB sorting
                 thumbnails.sort(key=lambda x: sum(x['avg_color']))
-        else:
-            # Fallback for no skimage - sort by brightness
-            thumbnails.sort(key=lambda x: sum(x['avg_color']))
         
         print(f"Thumbnails sorted by color properties for optimal matching")
         
@@ -715,13 +725,13 @@ def create_mosaic(img, thumbnails):
         print(traceback.format_exc())
         raise
 
-def save_mosaic(mosaic, output_path, quality=85):
+def save_mosaic(mosaic, output_path, quality=75):
     """Save the mosaic to a file with optimized compression."""
     try:
         # Make sure the directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        # Save the mosaic with optimized JPEG settings
+        # Save the mosaic with optimized JPEG settings for smaller file size
         mosaic.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
         print(f"Mosaic saved to {output_path}")
         return True
@@ -870,7 +880,7 @@ def main():
     mosaic_thumbnail = mosaic.copy()
     mosaic_thumbnail.thumbnail(thumbnail_size, Image.LANCZOS)
     thumbnail_path = os.path.join("output", f"thumbnail_{timestamp}.jpg")
-    save_mosaic(mosaic_thumbnail, thumbnail_path, quality=80)
+    save_mosaic(mosaic_thumbnail, thumbnail_path, quality=70)
     
     end_time = time.time()
     print(f"Mosaic generation completed in {end_time - start_time:.2f} seconds")
