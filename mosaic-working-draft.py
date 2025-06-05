@@ -15,13 +15,10 @@ from datetime import datetime
 import argparse
 import json
 import time
-import concurrent.futures
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from skimage.filters import threshold_otsu
-    from skimage import color, feature, exposure, segmentation
+    from skimage import color, feature, exposure
     SKIMAGE_AVAILABLE = True
 except ImportError:
     print("Warning: scikit-image not installed. Some advanced features will be limited.")
@@ -47,11 +44,11 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (1, 1)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (250, 250)  # High resolution for 300 DPI printing quality
+INTERNAL_THUMBNAIL_SIZE = (120, 120)  # High resolution for 300 DPI printing quality
 CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
-BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
-THUMBNAIL_LIMIT = 3000  # Reduced from 8000 to optimize memory and file size
+BRIGHTNESS_THRESHOLD = 250  # Include almost all brightness levels
+THUMBNAIL_LIMIT = 6000  # Reduced from 8000 to optimize memory and file size
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
 FOREGROUND_THRESHOLD = 0.08  # Sensitivity to foreground detection
 POSITION_RANDOMNESS = 0.05  # Very low randomness for precision
@@ -60,7 +57,6 @@ USE_VARIABLE_SIZES = True  # Use variable thumbnail sizes for better detail
 EDGE_ALIGNMENT = True  # Align thumbnails with edges for better detail definition
 MIN_THUMBNAIL_SCALE = 0.15  # Slightly larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
-MAX_CONCURRENT_DOWNLOADS = 20  # Maximum number of concurrent downloads
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -230,103 +226,8 @@ def enhance_image(img, contrast_factor=CONTRAST_FACTOR):
     
     return edge_img
 
-def detect_foreground_mask(image, threshold_method='adaptive'):
-    """
-    Detect foreground vs background in the image.
-    Returns a binary mask where True = foreground, False = background.
-    """
-    # Convert to grayscale for processing
-    gray = image.convert('L')
-    gray_array = np.array(gray)
-    
-    if threshold_method == 'adaptive' and SKIMAGE_AVAILABLE:
-        try:
-            # Use Otsu's method for automatic thresholding
-            threshold = threshold_otsu(gray_array)
-            # Invert because we assume dark subjects on light backgrounds
-            mask = gray_array < threshold
-            
-            # Apply morphological operations to clean up the mask
-            from skimage.morphology import binary_closing, binary_opening, disk
-            mask = binary_closing(mask, disk(5))
-            mask = binary_opening(mask, disk(3))
-            
-            print(f"Using Otsu thresholding with threshold: {threshold}")
-            return mask
-            
-        except Exception as e:
-            print(f"Otsu thresholding failed: {e}, falling back to simple method")
-    
-    # Fallback method: simple brightness-based thresholding
-    # Assume background is bright (white/light colored)
-    brightness_threshold = 200  # Adjust this value based on your images
-    
-    # Calculate local average to handle lighting variations
-    from scipy.ndimage import uniform_filter
-    local_avg = uniform_filter(gray_array.astype(float), size=20)
-    
-    # Create mask where pixels are significantly darker than local average
-    mask = gray_array < (local_avg - 30)
-    
-    # Remove small noise
-    from scipy.ndimage import binary_opening, binary_closing
-    mask = binary_opening(mask, structure=np.ones((3, 3)))
-    mask = binary_closing(mask, structure=np.ones((5, 5)))
-    
-    print("Using adaptive brightness-based foreground detection")
-    return mask
-
-def download_single_image(key, bucket=S3_BUCKET):
-    """Download and process a single image from S3."""
-    try:
-        # Create a new S3 client for this thread to avoid conflicts
-        thread_s3_client = boto3.client(
-            's3',
-            region_name=AWS_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-        )
-        
-        response = thread_s3_client.get_object(Bucket=bucket, Key=key)
-        image_data = response['Body'].read()
-        
-        # Open image using PIL
-        img = Image.open(BytesIO(image_data))
-        
-        # Ensure the image is in RGB mode
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        # Create a high-resolution version for internal storage
-        hi_res_img = img.resize(INTERNAL_THUMBNAIL_SIZE, Image.LANCZOS)
-        
-        # Create a preview version for color matching (smaller memory footprint)
-        preview_img = img.resize(THUMBNAIL_SIZE, Image.BILINEAR)
-        
-        # Calculate average color from the preview (faster than the hi-res)
-        img_array = np.array(preview_img)
-        avg_color = np.mean(img_array, axis=(0, 1)).astype(int)
-        
-        # Calculate color variance for texture assessment
-        color_variance = np.var(img_array, axis=(0, 1)).mean()
-        
-        # Clean up the preview to save memory
-        del preview_img
-        
-        return {
-            's3_key': key,
-            'avg_color': avg_color,
-            'image': hi_res_img,
-            'display_size': THUMBNAIL_SIZE,
-            'color_variance': color_variance
-        }
-        
-    except Exception as e:
-        print(f"Error processing S3 image {key}: {e}")
-        return None
-
 def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix="selected-images/"):
-    """Fetch thumbnail images from S3 bucket concurrently and process for mosaic use."""
+    """Fetch thumbnail images from S3 bucket and process for mosaic use."""
     thumbnails = []
     
     try:
@@ -334,6 +235,9 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix="selected-images/"):
         
         # Create a paginator for listing objects
         paginator = s3_client.get_paginator('list_objects_v2')
+        
+        # We'll count how many thumbnails we've processed
+        count = 0
         
         # Store all keys first so we can shuffle them for more variety
         all_image_keys = []
@@ -359,31 +263,50 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix="selected-images/"):
         # Limit to the requested number
         selected_keys = all_image_keys[:limit]
         
-        # Download images concurrently
-        print(f"Downloading {len(selected_keys)} images concurrently with {MAX_CONCURRENT_DOWNLOADS} workers...")
+        # Process selected keys
+        for key in selected_keys:
+            try:
+                response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+                image_data = response['Body'].read()
+                
+                # Open image using PIL
+                img = Image.open(BytesIO(image_data))
+                
+                # Ensure the image is in RGB mode
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Create a high-resolution version for internal storage
+                hi_res_img = img.resize(INTERNAL_THUMBNAIL_SIZE, Image.LANCZOS)
+                
+                # Create a preview version for color matching (smaller memory footprint)
+                preview_img = img.resize(THUMBNAIL_SIZE, Image.BILINEAR)
+                
+                # Calculate average color from the preview (faster than the hi-res)
+                img_array = np.array(preview_img)
+                avg_color = np.mean(img_array, axis=(0, 1)).astype(int)
+                
+                # Calculate color variance for texture assessment
+                color_variance = np.var(img_array, axis=(0, 1)).mean()
+                
+                # Add to our thumbnails list with extended metadata
+                thumbnails.append({
+                    's3_key': key,
+                    'avg_color': avg_color,
+                    'image': hi_res_img,  # Store the high-res version
+                    'display_size': THUMBNAIL_SIZE,  # Remember the display size
+                    'color_variance': color_variance  # Higher values = more texture
+                })
+                
+                # Clean up the preview to save memory
+                del preview_img
+                
+                count += 1
+                
+            except Exception as e:
+                print(f"Error processing S3 image {key}: {e}")
         
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
-            # Submit all download tasks
-            future_to_key = {executor.submit(download_single_image, key): key for key in selected_keys}
-            
-            # Process completed downloads
-            completed = 0
-            for future in as_completed(future_to_key):
-                key = future_to_key[future]
-                try:
-                    result = future.result()
-                    if result is not None:
-                        thumbnails.append(result)
-                    completed += 1
-                    
-                    # Progress update every 100 downloads
-                    if completed % 100 == 0:
-                        print(f"Downloaded {completed}/{len(selected_keys)} images...")
-                        
-                except Exception as e:
-                    print(f"Error downloading {key}: {e}")
-        
-        print(f"Successfully processed {len(thumbnails)} thumbnails concurrently")
+        print(f"Successfully processed {len(thumbnails)} thumbnails")
         
         # Sort thumbnails by color properties to help with matching
         if SKIMAGE_AVAILABLE:
@@ -430,11 +353,6 @@ def create_mosaic(img, thumbnails):
             
         # Save a copy of the original image for reference and color matching
         original_img = img.copy()
-        
-        # Detect foreground mask BEFORE any processing
-        print("Detecting foreground vs background...")
-        foreground_mask = detect_foreground_mask(original_img)
-        print(f"Foreground detection complete. Foreground pixels: {np.sum(foreground_mask)}/{foreground_mask.size}")
             
         # Enhance the image for edge detection ONLY
         # The enhanced version is only used for detail detection, not color matching
@@ -453,13 +371,9 @@ def create_mosaic(img, thumbnails):
             n_rows = max(1, math.floor(n_rows * scale_factor))
             print(f"Limiting mosaic to {n_cols}x{n_rows} cells for stability")
         
-        # Resize images and mask to match cell grid
+        # Resize images to match cell grid
         enhanced_img = enhanced_img.resize((n_cols * CELL_SIZE[0], n_rows * CELL_SIZE[1]), Image.BILINEAR)
         original_img = original_img.resize((n_cols * CELL_SIZE[0], n_rows * CELL_SIZE[1]), Image.BILINEAR)
-        
-        # Resize the foreground mask to match the grid
-        foreground_mask_resized = np.array(Image.fromarray(foreground_mask.astype(np.uint8) * 255).resize(
-            (n_cols * CELL_SIZE[0], n_rows * CELL_SIZE[1]), Image.NEAREST)) > 127
         
         # Calculate the mosaic dimensions - matching the grid spacing
         mosaic_width = n_cols * CELL_SIZE[0]
@@ -470,12 +384,11 @@ def create_mosaic(img, thumbnails):
         hi_res_width = int(mosaic_width * scale_factor)
         hi_res_height = int(mosaic_height * scale_factor)
         
-        # Create the high-resolution canvas - use white background
-        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (255, 255, 255))
+        # Create the high-resolution canvas - use a light gray instead of pure white
+        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (245, 245, 245))
         
         filled_cells = 0
         total_cells = n_cols * n_rows
-        foreground_cells = 0
         print(f"Creating high-resolution mosaic grid: {n_cols}x{n_rows} at {scale_factor}x scale")
         
         # Use enhanced image for edge detection
@@ -502,25 +415,13 @@ def create_mosaic(img, thumbnails):
         # Process grid by extracting cell average colors first - use ORIGINAL image for colors
         cell_colors = []
         cell_detail_levels = []
-        cell_foreground_flags = []
         
         for y in range(n_rows):
             row_colors = []
             row_details = []
-            row_foreground = []
             for x in range(n_cols):
                 cell_x = x * CELL_SIZE[0]
                 cell_y = y * CELL_SIZE[1]
-                
-                # Check if this cell is primarily foreground
-                cell_mask = foreground_mask_resized[cell_y:cell_y + CELL_SIZE[1], cell_x:cell_x + CELL_SIZE[0]]
-                foreground_ratio = np.mean(cell_mask)
-                is_foreground = foreground_ratio > FOREGROUND_THRESHOLD
-                row_foreground.append(is_foreground)
-                
-                if is_foreground:
-                    foreground_cells += 1
-                
                 # Use the original (non-enhanced) image for color extraction
                 cell = original_img.crop((cell_x, cell_y, cell_x + CELL_SIZE[0], cell_y + CELL_SIZE[1]))
                 avg_color = np.array(get_average_color(cell).astype(int))
@@ -534,9 +435,6 @@ def create_mosaic(img, thumbnails):
                 del cell
             cell_colors.append(row_colors)
             cell_detail_levels.append(row_details)
-            cell_foreground_flags.append(row_foreground)
-        
-        print(f"Found {foreground_cells} foreground cells out of {total_cells} total cells")
         
         # Release the source images from memory
         del enhanced_img
@@ -546,13 +444,9 @@ def create_mosaic(img, thumbnails):
         gc.collect()
 
         # Process each cell to place high-resolution thumbnails
-        # Only place thumbnails in foreground areas
+        # For photorealistic results, we need to fill EVERY cell
         for y in range(n_rows):
             for x in range(n_cols):
-                # Skip if this cell is background
-                if not cell_foreground_flags[y][x]:
-                    continue
-                
                 # Get the detail level for this cell
                 detail_level = cell_detail_levels[y][x]
                 
@@ -628,7 +522,7 @@ def create_mosaic(img, thumbnails):
                 if filled_cells % 500 == 0:
                     print(f"Placed {filled_cells} thumbnails so far...")
         
-        print(f"High-resolution mosaic created with {filled_cells} foreground thumbnails placed")
+        print(f"High-resolution mosaic created with {filled_cells}/{total_cells} cells filled")
         print(f"Final mosaic dimensions before rotation: {hi_res_width}x{hi_res_height} pixels")
 
         # rotate if needed
