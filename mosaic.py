@@ -10,6 +10,14 @@ from dotenv import load_dotenv
 from io import BytesIO
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
+
+# Add HEIC support
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    print("HEIC support enabled")
+except ImportError:
+    print("Warning: pillow-heif not installed. HEIC files won't be supported.")
 from scipy import ndimage
 from datetime import datetime
 import argparse
