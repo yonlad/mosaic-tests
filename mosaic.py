@@ -468,7 +468,7 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix="selected-images/"):
             for obj in page['Contents']:
                 # Skip if not an image file
                 key = obj['Key']
-                if not key.lower().endswith(('.jpg', '.jpeg', '.png')):
+                if not key.lower().endswith(('.jpg', '.jpeg', '.png', '.heic')):
                     continue
                 
                 all_image_keys.append(key)
@@ -815,7 +815,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='image (1)-removebg-preview.jpg', 
+    parser.add_argument('--image', type=str, default='IMG_6740.HEIC', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')
