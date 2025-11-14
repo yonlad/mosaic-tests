@@ -43,9 +43,7 @@ load_dotenv()
 AWS_REGION = os.getenv('REACT_APP_AWS_REGION', 'us-east-2')
 AWS_ACCESS_KEY_ID = os.getenv('REACT_APP_AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('REACT_APP_AWS_SECRET_ACCESS_KEY')
-# S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
-S3_BUCKET = 'mosaic.tests'
-FOLDER = 'new_colors/'
+S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -64,9 +62,9 @@ BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
 THUMBNAIL_LIMIT = 3500  # Increased for better variety and coverage
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
 FOREGROUND_THRESHOLD = 0.03  # More sensitive to include faces (lowered from 0.08)
-POSITION_RANDOMNESS = 0.0  # Zero randomness for perfect grid alignment
+POSITION_RANDOMNESS = 0.2  # Re-introduce some randomness to break up the grid
 DETAIL_SENSITIVITY = 2.0  # Higher sensitivity for ultra-fine details
-USE_VARIABLE_SIZES = False  # Uniform sizes for consistent photorealistic effect
+USE_VARIABLE_SIZES = False  # Disable variable sizes by default for a simpler approach
 EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
@@ -457,7 +455,7 @@ def download_single_image(key, bucket=S3_BUCKET):
         print(f"Error processing S3 image {key}: {e}")
         return None
 
-def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix=FOLDER):
+def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix="selected-images/"):
     """Fetch thumbnail images from S3 bucket concurrently and process for mosaic use."""
     thumbnails = []
     
@@ -825,7 +823,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='capture_20250610_230846.jpg', 
+    parser.add_argument('--image', type=str, default='Screenshot 2025-07-12 at 12.50.29 PM.png', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')

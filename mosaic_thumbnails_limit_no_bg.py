@@ -45,7 +45,7 @@ AWS_ACCESS_KEY_ID = os.getenv('REACT_APP_AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('REACT_APP_AWS_SECRET_ACCESS_KEY')
 # S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
 S3_BUCKET = 'mosaic.tests'
-FOLDER = 'new_colors/'
+FOLDER = 'no_background_flora/'
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -57,7 +57,7 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (1, 1)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (60, 60)  # Much smaller for ultra-photorealistic blending
+INTERNAL_THUMBNAIL_SIZE = (120, 120)  # Much smaller for ultra-photorealistic blending
 CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
@@ -70,12 +70,30 @@ USE_VARIABLE_SIZES = False  # Uniform sizes for consistent photorealistic effect
 EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
-MAX_CONCURRENT_DOWNLOADS = 20  # Maximum number of concurrent downloads
+MAX_CONCURRENT_DOWNLOADS = 50  # Maximum number of concurrent downloads
+MAX_THUMBNAIL_USAGE = 1500
 
 def get_average_color(img):
-    """Calculate the average color of an image."""
+    """Calculate the average color of an image, handling both RGB and RGBA modes."""
     img_array = np.array(img)
-    avg_color = np.mean(img_array, axis=(0, 1))
+    
+    if img.mode == 'RGBA':
+        # For RGBA images, only calculate average from non-transparent pixels
+        alpha_channel = img_array[:, :, 3]
+        non_transparent_mask = alpha_channel > 0
+        
+        if np.any(non_transparent_mask):
+            # Calculate average color only from non-transparent pixels
+            rgb_channels = img_array[:, :, :3]
+            masked_pixels = rgb_channels[non_transparent_mask]
+            avg_color = np.mean(masked_pixels, axis=0)
+        else:
+            # If all pixels are transparent, return white as default
+            avg_color = np.array([255, 255, 255])
+    else:
+        # For RGB images, calculate average normally
+        avg_color = np.mean(img_array, axis=(0, 1))
+    
     return avg_color
 
 def calculate_detail_level(cell_image, edges_array, cell_x, cell_y, cell_width, cell_height):
@@ -141,7 +159,7 @@ def get_edge_orientation(edges, x, y, window_size=15):
     
     return 0  # Default no rotation
 
-def find_best_match(target_color, thumbnails, cell_detail=0.0):
+def find_best_match(target_color, thumbnails, cell_detail=0.0, max_usage=10):
     """Find the thumbnail with the closest average color to the target color.
     
     Args:
@@ -156,6 +174,10 @@ def find_best_match(target_color, thumbnails, cell_detail=0.0):
     best_match = None
     
     target_color = np.array(target_color).astype(float)
+    
+    # Ensure target_color is 3-channel RGB
+    if len(target_color) != 3:
+        target_color = target_color[:3]  # Take only RGB channels if RGBA
     
     # Convert to LAB color space if scikit-image is available
     if SKIMAGE_AVAILABLE:
@@ -179,9 +201,16 @@ def find_best_match(target_color, thumbnails, cell_detail=0.0):
     
     # First pass: calculate distances and keep top candidates
     for thumbnail in thumbnails:
+        if 'usage_count' in thumbnail and thumbnail['usage_count'] >= max_usage:
+            continue
+
         if target_lab is not None:
             # Use LAB color space for perceptual accuracy
-            thumbnail_rgb = thumbnail['avg_color'].reshape(1, 1, 3) / 255.0
+            thumb_color = np.array(thumbnail['avg_color'])
+            # Ensure thumbnail color is 3-channel RGB
+            if len(thumb_color) != 3:
+                thumb_color = thumb_color[:3]  # Take only RGB channels if RGBA
+            thumbnail_rgb = thumb_color.reshape(1, 1, 3) / 255.0
             thumbnail_lab = color.rgb2lab(thumbnail_rgb).reshape(3)
             
             # LAB distance (DE76)
@@ -191,8 +220,13 @@ def find_best_match(target_color, thumbnails, cell_detail=0.0):
             # Green is more perceptually important, followed by red, then blue
             weights = np.array([0.3, 0.6, 0.1])  # RGB weights
             
+            # Ensure thumbnail color is 3-channel RGB
+            thumb_color = np.array(thumbnail['avg_color'])
+            if len(thumb_color) != 3:
+                thumb_color = thumb_color[:3]  # Take only RGB channels if RGBA
+            
             # Calculate weighted Euclidean distance
-            weighted_diff = (target_color - thumbnail['avg_color']) * weights
+            weighted_diff = (target_color - thumb_color) * weights
             distance = np.sum(weighted_diff**2)
         
         # Add candidates with distance and thumbnail
@@ -425,8 +459,11 @@ def download_single_image(key, bucket=S3_BUCKET):
         # Open image using PIL
         img = Image.open(BytesIO(image_data))
         
-        # Ensure the image is in RGB mode
-        if img.mode != 'RGB':
+        # Preserve RGBA for transparent images, convert others to RGB
+        if img.mode == 'RGBA':
+            # Keep RGBA mode for transparent images
+            pass
+        elif img.mode != 'RGB':
             img = img.convert('RGB')
         
         # Create a high-resolution version for internal storage
@@ -544,6 +581,10 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix=FOLDER):
 def create_mosaic(img, thumbnails):
     """Create a photorealistic mosaic of the input image using the provided thumbnails."""
     try:
+        # Initialize usage count for each thumbnail to track usage
+        for thumb in thumbnails:
+            thumb['usage_count'] = 0
+
         # Size check - restrict to reasonable dimensions to prevent memory issues
         max_dimension = 800
         width, height = img.size
@@ -599,8 +640,8 @@ def create_mosaic(img, thumbnails):
         hi_res_width = int(mosaic_width * scale_factor)
         hi_res_height = int(mosaic_height * scale_factor)
         
-        # Create the high-resolution canvas - use white background
-        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (255, 255, 255))
+        # Create the high-resolution canvas - use white background with full opacity
+        mosaic = Image.new('RGBA', (hi_res_width, hi_res_height), (255, 255, 255, 255))
         
         filled_cells = 0
         total_cells = n_cols * n_rows
@@ -690,10 +731,13 @@ def create_mosaic(img, thumbnails):
                 
                 # Use all thumbnails for all areas (simplified approach)
                 # Find the best match with more weight on color accuracy in detailed areas
-                best_match = find_best_match(avg_color, thumbnails, detail_level)
+                best_match = find_best_match(avg_color, thumbnails, detail_level, MAX_THUMBNAIL_USAGE)
                 if not best_match:
                     continue
                     
+                # Increment the usage count for the selected thumbnail
+                best_match['usage_count'] += 1
+                
                 # Calculate the high-resolution position
                 hi_res_x = int(x * CELL_SIZE[0] * scale_factor)
                 hi_res_y = int(y * CELL_SIZE[1] * scale_factor)
@@ -749,8 +793,13 @@ def create_mosaic(img, thumbnails):
                     except Exception as e:
                         pass
                 
-                # Place the high-resolution thumbnail
-                mosaic.paste(thumbnail_to_paste, (hi_res_x, hi_res_y))
+                # Place the high-resolution thumbnail with transparency support
+                if thumbnail_to_paste.mode == 'RGBA':
+                    # Use the alpha channel as mask for transparent images
+                    mosaic.paste(thumbnail_to_paste, (hi_res_x, hi_res_y), thumbnail_to_paste)
+                else:
+                    # Regular paste for RGB images
+                    mosaic.paste(thumbnail_to_paste, (hi_res_x, hi_res_y))
                 filled_cells += 1
                 
                 # Periodic status updates
@@ -778,14 +827,46 @@ def create_mosaic(img, thumbnails):
         raise
 
 def save_mosaic(mosaic, output_path, quality=75):
-    """Save the mosaic to a file with optimized compression."""
+    """Save the mosaic to a file with optimized compression, handling transparency."""
     try:
         # Make sure the directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        # Save the mosaic with optimized JPEG settings for smaller file size
-        mosaic.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
-        print(f"Mosaic saved to {output_path}")
+        # Check if the image has meaningful transparency
+        has_transparency = False
+        if mosaic.mode == 'RGBA':
+            # Check if there are any pixels with alpha < 255
+            alpha_channel = np.array(mosaic)[:, :, 3]
+            has_transparency = np.any(alpha_channel < 255)
+        
+        # Determine output format based on transparency and file extension
+        file_ext = os.path.splitext(output_path)[1].lower()
+        
+        if has_transparency and file_ext != '.jpg' and file_ext != '.jpeg':
+            # Save as PNG to preserve transparency
+            if not file_ext:
+                output_path += '.png'
+            elif file_ext not in ['.png']:
+                # Change extension to PNG
+                output_path = os.path.splitext(output_path)[0] + '.png'
+            
+            mosaic.save(output_path, format="PNG", optimize=True)
+            print(f"Mosaic with transparency saved as PNG to {output_path}")
+        else:
+            # Convert to RGB for JPEG saving or if no transparency
+            if mosaic.mode == 'RGBA':
+                # Create white background and composite the RGBA image onto it
+                rgb_mosaic = Image.new('RGB', mosaic.size, (255, 255, 255))
+                rgb_mosaic.paste(mosaic, mask=mosaic.split()[-1])  # Use alpha as mask
+                mosaic = rgb_mosaic
+            
+            # Ensure JPEG extension
+            if file_ext not in ['.jpg', '.jpeg']:
+                output_path = os.path.splitext(output_path)[0] + '.jpg'
+            
+            mosaic.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
+            print(f"Mosaic saved as JPEG to {output_path}")
+        
         return True
     except Exception as e:
         print(f"Error saving mosaic: {e}")
@@ -795,8 +876,11 @@ def load_image_from_local(image_path):
     """Load image from local file."""
     try:
         img = Image.open(image_path)
-        # Ensure the image is in RGB mode
-        if img.mode != 'RGB':
+        # Preserve RGBA for transparent images, convert others to RGB
+        if img.mode == 'RGBA':
+            # Keep RGBA mode for transparent images
+            pass
+        elif img.mode != 'RGB':
             img = img.convert('RGB')
         return img
     except Exception as e:
@@ -809,8 +893,11 @@ def load_image_from_s3(s3_key):
         response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
         image_data = response['Body'].read()
         img = Image.open(BytesIO(image_data))
-        # Ensure the image is in RGB mode
-        if img.mode != 'RGB':
+        # Preserve RGBA for transparent images, convert others to RGB
+        if img.mode == 'RGBA':
+            # Keep RGBA mode for transparent images
+            pass
+        elif img.mode != 'RGB':
             img = img.convert('RGB')
         return img
     except Exception as e:

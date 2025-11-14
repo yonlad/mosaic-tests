@@ -45,7 +45,7 @@ AWS_ACCESS_KEY_ID = os.getenv('REACT_APP_AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('REACT_APP_AWS_SECRET_ACCESS_KEY')
 # S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
 S3_BUCKET = 'mosaic.tests'
-FOLDER = 'new_colors/'
+FOLDER = 'no_ai_whiteandblackbg/'
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -57,7 +57,7 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (1, 1)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (60, 60)  # Much smaller for ultra-photorealistic blending
+INTERNAL_THUMBNAIL_SIZE = (120, 120)  # Much smaller for ultra-photorealistic blending
 CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
@@ -70,7 +70,8 @@ USE_VARIABLE_SIZES = False  # Uniform sizes for consistent photorealistic effect
 EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
-MAX_CONCURRENT_DOWNLOADS = 20  # Maximum number of concurrent downloads
+MAX_CONCURRENT_DOWNLOADS = 50  # Maximum number of concurrent downloads
+MAX_THUMBNAIL_USAGE = 50
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -141,7 +142,7 @@ def get_edge_orientation(edges, x, y, window_size=15):
     
     return 0  # Default no rotation
 
-def find_best_match(target_color, thumbnails, cell_detail=0.0):
+def find_best_match(target_color, thumbnails, cell_detail=0.0, max_usage=10):
     """Find the thumbnail with the closest average color to the target color.
     
     Args:
@@ -179,6 +180,9 @@ def find_best_match(target_color, thumbnails, cell_detail=0.0):
     
     # First pass: calculate distances and keep top candidates
     for thumbnail in thumbnails:
+        if 'usage_count' in thumbnail and thumbnail['usage_count'] >= max_usage:
+            continue
+
         if target_lab is not None:
             # Use LAB color space for perceptual accuracy
             thumbnail_rgb = thumbnail['avg_color'].reshape(1, 1, 3) / 255.0
@@ -544,6 +548,10 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix=FOLDER):
 def create_mosaic(img, thumbnails):
     """Create a photorealistic mosaic of the input image using the provided thumbnails."""
     try:
+        # Initialize usage count for each thumbnail to track usage
+        for thumb in thumbnails:
+            thumb['usage_count'] = 0
+
         # Size check - restrict to reasonable dimensions to prevent memory issues
         max_dimension = 800
         width, height = img.size
@@ -690,10 +698,13 @@ def create_mosaic(img, thumbnails):
                 
                 # Use all thumbnails for all areas (simplified approach)
                 # Find the best match with more weight on color accuracy in detailed areas
-                best_match = find_best_match(avg_color, thumbnails, detail_level)
+                best_match = find_best_match(avg_color, thumbnails, detail_level, MAX_THUMBNAIL_USAGE)
                 if not best_match:
                     continue
                     
+                # Increment the usage count for the selected thumbnail
+                best_match['usage_count'] += 1
+                
                 # Calculate the high-resolution position
                 hi_res_x = int(x * CELL_SIZE[0] * scale_factor)
                 hi_res_y = int(y * CELL_SIZE[1] * scale_factor)
@@ -825,7 +836,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='capture_20250610_230846.jpg', 
+    parser.add_argument('--image', type=str, default='Group 4.png', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')

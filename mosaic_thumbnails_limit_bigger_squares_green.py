@@ -45,7 +45,7 @@ AWS_ACCESS_KEY_ID = os.getenv('REACT_APP_AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('REACT_APP_AWS_SECRET_ACCESS_KEY')
 # S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
 S3_BUCKET = 'mosaic.tests'
-FOLDER = 'new_colors/'
+FOLDER = 'no_ai_whiteandblackbg/'
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -56,9 +56,9 @@ s3_client = boto3.client(
 )
 
 # Mosaic configuration - you can adjust these parameters to experiment
-THUMBNAIL_SIZE = (1, 1)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (60, 60)  # Much smaller for ultra-photorealistic blending
-CELL_SIZE = (1, 1)  # Spacing between thumbnails (controls density) - smaller for photorealistic
+THUMBNAIL_SIZE = (2, 2)  # Size for display/layout - smaller for photorealistic
+INTERNAL_THUMBNAIL_SIZE = (480, 480)  # Much smaller for ultra-photorealistic blending
+CELL_SIZE = (2, 2)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
 THUMBNAIL_LIMIT = 3500  # Increased for better variety and coverage
@@ -70,7 +70,8 @@ USE_VARIABLE_SIZES = False  # Uniform sizes for consistent photorealistic effect
 EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
-MAX_CONCURRENT_DOWNLOADS = 20  # Maximum number of concurrent downloads
+MAX_CONCURRENT_DOWNLOADS = 50  # Maximum number of concurrent downloads
+MAX_THUMBNAIL_USAGE = 50
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -141,7 +142,7 @@ def get_edge_orientation(edges, x, y, window_size=15):
     
     return 0  # Default no rotation
 
-def find_best_match(target_color, thumbnails, cell_detail=0.0):
+def find_best_match(target_color, thumbnails, cell_detail=0.0, max_usage=10):
     """Find the thumbnail with the closest average color to the target color.
     
     Args:
@@ -179,6 +180,9 @@ def find_best_match(target_color, thumbnails, cell_detail=0.0):
     
     # First pass: calculate distances and keep top candidates
     for thumbnail in thumbnails:
+        if 'usage_count' in thumbnail and thumbnail['usage_count'] >= max_usage:
+            continue
+
         if target_lab is not None:
             # Use LAB color space for perceptual accuracy
             thumbnail_rgb = thumbnail['avg_color'].reshape(1, 1, 3) / 255.0
@@ -544,6 +548,10 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix=FOLDER):
 def create_mosaic(img, thumbnails):
     """Create a photorealistic mosaic of the input image using the provided thumbnails."""
     try:
+        # Initialize usage count for each thumbnail to track usage
+        for thumb in thumbnails:
+            thumb['usage_count'] = 0
+
         # Size check - restrict to reasonable dimensions to prevent memory issues
         max_dimension = 800
         width, height = img.size
@@ -599,8 +607,8 @@ def create_mosaic(img, thumbnails):
         hi_res_width = int(mosaic_width * scale_factor)
         hi_res_height = int(mosaic_height * scale_factor)
         
-        # Create the high-resolution canvas - use white background
-        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (255, 255, 255))
+        # Create the high-resolution canvas - use neon green background
+        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (57, 255, 20))
         
         filled_cells = 0
         total_cells = n_cols * n_rows
@@ -690,10 +698,13 @@ def create_mosaic(img, thumbnails):
                 
                 # Use all thumbnails for all areas (simplified approach)
                 # Find the best match with more weight on color accuracy in detailed areas
-                best_match = find_best_match(avg_color, thumbnails, detail_level)
+                best_match = find_best_match(avg_color, thumbnails, detail_level, MAX_THUMBNAIL_USAGE)
                 if not best_match:
                     continue
                     
+                # Increment the usage count for the selected thumbnail
+                best_match['usage_count'] += 1
+                
                 # Calculate the high-resolution position
                 hi_res_x = int(x * CELL_SIZE[0] * scale_factor)
                 hi_res_y = int(y * CELL_SIZE[1] * scale_factor)
@@ -777,18 +788,51 @@ def create_mosaic(img, thumbnails):
         print(traceback.format_exc())
         raise
 
-def save_mosaic(mosaic, output_path, quality=75):
-    """Save the mosaic to a file with optimized compression."""
+def save_mosaic(mosaic, output_path, format="JPEG", quality=75, max_tiff_dimension=20000):
+    """Save the mosaic to a file with specified format and compression."""
     try:
         # Make sure the directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        # Save the mosaic with optimized JPEG settings for smaller file size
-        mosaic.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
-        print(f"Mosaic saved to {output_path}")
+        # Check if image is too large for TIFF format
+        width, height = mosaic.size
+        estimated_size_gb = (width * height * 3) / (1024 * 1024 * 1024)  # RGB bytes to GB
+        
+        if format.upper() == "TIFF":
+            # Check if image is too large for TIFF
+            if width > max_tiff_dimension or height > max_tiff_dimension or estimated_size_gb > 3.5:
+                print(f"Warning: Image too large for TIFF ({width}x{height}, ~{estimated_size_gb:.1f}GB)")
+                print(f"Skipping TIFF save to avoid errors. Consider using PNG instead.")
+                return False
+        
+        # Save with format-specific settings
+        if format.upper() == "JPEG":
+            mosaic.save(output_path, format=format, quality=quality, optimize=True, progressive=True)
+        elif format.upper() == "PNG":
+            # PNG supports lossless compression with optimize
+            # For very large images, disable optimization to avoid memory issues
+            if estimated_size_gb > 2.0:
+                print(f"Large image detected ({estimated_size_gb:.1f}GB), using basic PNG compression")
+                mosaic.save(output_path, format=format, optimize=False)
+            else:
+                mosaic.save(output_path, format=format, optimize=True)
+        elif format.upper() == "TIFF":
+            # Use different compression for large images
+            if estimated_size_gb > 1.0:
+                print(f"Using JPEG compression within TIFF for large image")
+                mosaic.save(output_path, format=format, compression='jpeg', quality=85)
+            else:
+                mosaic.save(output_path, format=format, compression='lzw')
+        else:
+            # Default save for other formats
+            mosaic.save(output_path, format=format)
+            
+        print(f"Mosaic saved to {output_path} as {format}")
         return True
     except Exception as e:
-        print(f"Error saving mosaic: {e}")
+        print(f"Error saving mosaic as {format}: {e}")
+        if format.upper() == "TIFF":
+            print("TIFF save failed - image may be too large. Try PNG instead.")
         return False
 
 def load_image_from_local(image_path):
@@ -824,8 +868,8 @@ def main():
     global FOREGROUND_THRESHOLD, POSITION_RANDOMNESS, DETAIL_SENSITIVITY
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
-    parser = argparse.ArgumentParser(description='Generate a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='capture_20250610_230846.jpg', 
+    parser = argparse.ArgumentParser(description='Generate  a mosaic from an image using thumbnails from S3')
+    parser.add_argument('--image', type=str, default='Frame 11.png', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')
@@ -855,6 +899,10 @@ def main():
                         help='Align thumbnails with detected edges')
     parser.add_argument('--min-thumbnail-scale', type=float, default=MIN_THUMBNAIL_SCALE,
                         help='Minimum scale factor for thumbnails in detailed areas')
+    parser.add_argument('--max-tiff-dimension', type=int, default=20000,
+                        help='Maximum width/height for TIFF files (default: 20000)')
+    parser.add_argument('--skip-tiff', action='store_true',
+                        help='Skip TIFF format entirely (useful for very large mosaics)')
     
     args = parser.parse_args()
     
@@ -921,18 +969,49 @@ def main():
     del thumbnails
     gc.collect()
     
-    # Save the mosaic
+    # Save the mosaic in multiple formats
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"mosaic_{timestamp}.jpg"
-    output_path = os.path.join("output", output_filename)
-    save_mosaic(mosaic, output_path)
     
-    # Save a smaller thumbnail for quick viewing
-    thumbnail_size = (800, 1200)
-    mosaic_thumbnail = mosaic.copy()
-    mosaic_thumbnail.thumbnail(thumbnail_size, Image.LANCZOS)
-    thumbnail_path = os.path.join("output", f"thumbnail_{timestamp}.jpg")
-    save_mosaic(mosaic_thumbnail, thumbnail_path, quality=70)
+    # Print mosaic size info
+    width, height = mosaic.size
+    estimated_size_gb = (width * height * 3) / (1024 * 1024 * 1024)
+    print(f"Final mosaic size: {width}x{height} pixels (~{estimated_size_gb:.1f}GB uncompressed)")
+    
+    # Save as TIFF (lossless, high quality) - with size check
+    tiff_success = False
+    if not args.skip_tiff:
+        tiff_filename = f"mosaic_{timestamp}.tiff"
+        tiff_path = os.path.join("output", tiff_filename)
+        tiff_success = save_mosaic(mosaic, tiff_path, format="TIFF", max_tiff_dimension=args.max_tiff_dimension)
+        if not tiff_success:
+            print("TIFF save skipped due to size limitations")
+    else:
+        print("TIFF save skipped (--skip-tiff flag used)")
+        tiff_path = "N/A"
+    
+    # Save as PNG (lossless, smaller than TIFF)
+    png_filename = f"mosaic_{timestamp}.png"
+    png_path = os.path.join("output", png_filename)
+    png_success = save_mosaic(mosaic, png_path, format="PNG")
+    
+    # Save as JPEG for compatibility and smaller file size
+    jpg_filename = f"mosaic_{timestamp}.jpg"
+    jpg_path = os.path.join("output", jpg_filename)
+    jpg_success = save_mosaic(mosaic, jpg_path, format="JPEG", quality=75)
+    
+    
+    # Summary of saved files
+    print(f"\nSaved files summary:")
+    if args.skip_tiff:
+        print(f"✗ TIFF: Skipped (--skip-tiff flag)")
+    elif tiff_success:
+        print(f"✓ TIFF: {tiff_path}")
+    else:
+        print(f"✗ TIFF: Skipped (too large)")
+    if png_success:
+        print(f"✓ PNG: {png_path}")
+    if jpg_success:
+        print(f"✓ JPEG: {jpg_path}")
     
     end_time = time.time()
     print(f"Mosaic generation completed in {end_time - start_time:.2f} seconds")

@@ -1,0 +1,9 @@
+boto3
+botocore
+gradio_client
+Pillow
+requests
+tqdm
+python-dotenv
+distinctipy
+opencv-python
