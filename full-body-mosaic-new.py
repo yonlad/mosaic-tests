@@ -65,7 +65,8 @@ class MosaicConfig:
     boundary_min_cell_size: int = 40  # enforce larger tiles along FG boundary to avoid micro tiles
 
     # Thumbnails (hi-res building blocks)
-    internal_thumbnail_size: Tuple[int, int] = (128, 128)
+    internal_thumbnail_size: Tuple[int, int] = (480, 480)
+    use_full_res_thumbs: bool = False
 
     # Matching
     reuse_penalty: float = 0.15
@@ -88,10 +89,12 @@ class MosaicConfig:
 
     # Output
     output_dir: str = "output"
-    jpeg_quality: int = 80
+    jpeg_quality: int = 90
+    output_format: str = "JPEG"
     save_thumbnail: bool = True
     output_long_side: int = 8000
     max_source_image_pixels: Optional[int] = None  # None disables Pillow's decompression bomb guard
+    source_downscale_long_side: Optional[int] = 1200
 
     # Blending
     blend_with_source: bool = True
@@ -143,16 +146,18 @@ def _new_s3_client(cfg: MosaicConfig):
     )
 
 
-def _download_single_image_s3(s3_client, bucket: str, key: str, internal_size: Tuple[int, int]) -> Optional[Thumb]:
+def _download_single_image_s3(s3_client, bucket: str, key: str, cfg: MosaicConfig) -> Optional[Thumb]:
     try:
         body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
         img = Image.open(BytesIO(body))
         img = _ensure_rgb(img)
-        hi = img.resize(internal_size, Image.LANCZOS)
+        # Use resized copy for matching stats; optionally keep full-res for placement
+        hi = img.resize(cfg.internal_thumbnail_size, Image.LANCZOS)
         arr = np.array(hi, dtype=np.uint8)
         avg_rgb = arr.reshape(-1, 3).mean(axis=0)
         avg_lab = _to_lab(arr).reshape(-1, 3).mean(axis=0) if SKIMAGE_AVAILABLE else None
-        return Thumb(s3_key=key, image=hi, avg_color_rgb=avg_rgb, avg_color_lab=avg_lab)
+        chosen_image = img if cfg.use_full_res_thumbs else hi
+        return Thumb(s3_key=key, image=chosen_image, avg_color_rgb=avg_rgb, avg_color_lab=avg_lab)
     except Exception:
         return None
 
@@ -184,7 +189,7 @@ def fetch_thumbnails_from_s3(cfg: MosaicConfig) -> List[Thumb]:
 
     thumbs: List[Thumb] = []
     with ThreadPoolExecutor(max_workers=cfg.max_concurrent_downloads) as ex:
-        futures = {ex.submit(_download_single_image_s3, s3_client, cfg.s3_bucket, k, cfg.internal_thumbnail_size): k for k in keys}
+        futures = {ex.submit(_download_single_image_s3, s3_client, cfg.s3_bucket, k, cfg): k for k in keys}
         completed = 0
         for fut in as_completed(futures):
             t = fut.result()
@@ -576,11 +581,11 @@ def run(cfg: MosaicConfig) -> Optional[Image.Image]:
     if src_img is None:
         return None
 
-    # Downscale source for tractability if huge; target longest side ~1000 px
+    # Downscale source for tractability if huge; can be disabled via config
     w, h = src_img.size
     max_side = max(w, h)
-    if max_side > 1200:
-        scale = 1200.0 / max_side
+    if cfg.source_downscale_long_side is not None and cfg.source_downscale_long_side > 0 and max_side > cfg.source_downscale_long_side:
+        scale = float(cfg.source_downscale_long_side) / max_side
         nw, nh = int(w * scale), int(h * scale)
         src_img = src_img.resize((nw, nh), Image.BILINEAR)
         w, h = nw, nh
@@ -599,8 +604,12 @@ def run(cfg: MosaicConfig) -> Optional[Image.Image]:
 
     os.makedirs(cfg.output_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(cfg.output_dir, f"mosaic_new_{ts}.jpg")
-    mosaic.save(out_path, format="JPEG", quality=cfg.jpeg_quality, optimize=True, progressive=True)
+    out_ext = "jpg" if cfg.output_format.upper() in ("JPG", "JPEG") else cfg.output_format.lower()
+    out_path = os.path.join(cfg.output_dir, f"mosaic_new_{ts}.{out_ext}")
+    save_kwargs: Dict[str, Any] = {}
+    if cfg.output_format.upper() in ("JPG", "JPEG"):
+        save_kwargs.update(dict(quality=cfg.jpeg_quality, optimize=True, progressive=True))
+    mosaic.save(out_path, format=cfg.output_format, **save_kwargs)
 
     if cfg.save_thumbnail:
         thumb = mosaic.copy()
@@ -631,6 +640,7 @@ def _parse_args() -> MosaicConfig:
     p.add_argument("--background-min-cell-size", type=int, default=MosaicConfig.background_min_cell_size)
     p.add_argument("--boundary-min-cell-size", type=int, default=MosaicConfig.boundary_min_cell_size)
     p.add_argument("--internal-thumbnail-size", type=int, nargs=2, default=list(MosaicConfig.internal_thumbnail_size))
+    p.add_argument("--use-full-res-thumbs", action="store_true", default=MosaicConfig.use_full_res_thumbs, help="Keep original downloaded thumbnail resolution for placement (more RAM)")
     p.add_argument("--reuse-penalty", type=float, default=MosaicConfig.reuse_penalty)
     p.add_argument("--max-thumbnail-usage", type=int, default=MosaicConfig.max_thumbnail_usage)
     p.add_argument("--color-space", type=str, default=MosaicConfig.color_space, choices=["lab", "rgb"])
@@ -651,10 +661,17 @@ def _parse_args() -> MosaicConfig:
     p.add_argument("--var-weight", type=float, default=MosaicConfig.var_weight)
     p.add_argument("--output-dir", type=str, default=MosaicConfig.output_dir)
     p.add_argument("--jpeg-quality", type=int, default=MosaicConfig.jpeg_quality)
+    p.add_argument("--output-format", type=str, default=MosaicConfig.output_format, choices=["JPEG", "PNG", "TIFF", "JPG"])
     p.add_argument("--save-thumbnail", action="store_true", default=MosaicConfig.save_thumbnail)
     p.add_argument("--no-blend", action="store_true")
     p.add_argument("--blend-alpha", type=float, default=MosaicConfig.blend_alpha)
     p.add_argument("--output-long-side", type=int, default=MosaicConfig.output_long_side)
+    p.add_argument(
+        "--source-downscale-long-side",
+        type=int,
+        default=MosaicConfig.source_downscale_long_side,
+        help="Resize source so longest side equals this (set <=0 to disable)",
+    )
     p.add_argument(
         "--max-source-image-pixels",
         type=int,
@@ -676,6 +693,7 @@ def _parse_args() -> MosaicConfig:
         background_min_cell_size=args.background_min_cell_size,
         boundary_min_cell_size=args.boundary_min_cell_size,
         internal_thumbnail_size=tuple(args.internal_thumbnail_size),
+        use_full_res_thumbs=args.use_full_res_thumbs,
         reuse_penalty=args.reuse_penalty,
         max_thumbnail_usage=args.max_thumbnail_usage,
         color_space=args.color_space,
@@ -689,10 +707,12 @@ def _parse_args() -> MosaicConfig:
         var_weight=args.var_weight,
         output_dir=args.output_dir,
         jpeg_quality=args.jpeg_quality,
+        output_format=args.output_format,
         save_thumbnail=args.save_thumbnail,
         blend_with_source=(not args.no_blend),
         blend_alpha=args.blend_alpha,
         output_long_side=args.output_long_side,
+        source_downscale_long_side=args.source_downscale_long_side,
         max_source_image_pixels=args.max_source_image_pixels,
     )
     return cfg

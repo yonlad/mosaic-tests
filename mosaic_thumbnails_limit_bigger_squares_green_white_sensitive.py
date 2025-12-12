@@ -57,13 +57,13 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (2, 2)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (120, 120)  # Much smaller for ultra-photorealistic blending (480, 480 for best print)
+INTERNAL_THUMBNAIL_SIZE = (480, 480)  # Much smaller for ultra-photorealistic blending (480, 480 for best print)
 CELL_SIZE = (2, 2)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
-BRIGHTNESS_THRESHOLD = 200  # Include almost all brightness levels
+BRIGHTNESS_THRESHOLD = 240  # Include almost all brightness levels
 THUMBNAIL_LIMIT = 3500  # Increased for better variety and coverage
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
-FOREGROUND_THRESHOLD = 0.03  # More sensitive to include faces (lowered from 0.08)
+FOREGROUND_THRESHOLD = 0.01  # More sensitive to include faces (lowered from 0.08)
 POSITION_RANDOMNESS = 0.0  # Zero randomness for perfect grid alignment
 DETAIL_SENSITIVITY = 2.0  # Higher sensitivity for ultra-fine details
 USE_VARIABLE_SIZES = False  # Uniform sizes for consistent photorealistic effect
@@ -71,7 +71,7 @@ EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
 MAX_CONCURRENT_DOWNLOADS = 50  # Maximum number of concurrent downloads
-MAX_THUMBNAIL_USAGE = 10
+MAX_THUMBNAIL_USAGE = 50
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -266,7 +266,7 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
             
             # 2. Very inclusive mask that captures most of the subject including bright faces
             # Use a much higher threshold to include faces
-            bright_inclusive_threshold = min(250, threshold + 80)  # Much more generous
+            bright_inclusive_threshold = min(255, threshold + 80)  # Much more generous
             bright_mask = gray_array < bright_inclusive_threshold
             
             # 3. Skin tone detection for faces
@@ -295,7 +295,7 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
             
             # Use Sobel edge detection
             edges = sobel(gray_array)
-            edge_threshold = np.percentile(edges, 70)  # Lower percentile to catch more edges
+            edge_threshold = np.percentile(edges, 60)  # Lower percentile to catch more edges
             strong_edges = edges > edge_threshold
             
             # Dilate edges to create regions
@@ -312,7 +312,7 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
             center_weight = 1.0 - (center_distance / max_distance)
             
             # Areas close to center are more likely to be foreground
-            center_mask = center_weight > 0.3  # Include central 70% of image
+            center_mask = center_weight > 0.2  # Include central 70% of image
             
             # Combine all approaches
             # Start with skin areas (high confidence for faces)
@@ -357,7 +357,7 @@ def detect_foreground_mask(image, threshold_method='adaptive'):
     r, g, b = rgb_array[:,:,0], rgb_array[:,:,1], rgb_array[:,:,2]
     
     # 1. Very generous global thresholding
-    global_threshold = 240  # Much higher to include bright faces
+    global_threshold = 255  # Much higher to include bright faces
     global_mask = gray_array < global_threshold
     
     # 2. Skin tone detection (same as above)
