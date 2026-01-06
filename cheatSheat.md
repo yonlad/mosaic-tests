@@ -9,7 +9,7 @@ python /Users/ledi/Desktop/WORK/DMINTI/mosaic-tests/full-body-mosaic-new.py \
   --background-min-cell-size 5 \
   --boundary-min-cell-size 20 \
   --detail-threshold 1.0 \
-  --internal-thumbnail-size 480 480 \
+  --internal-thumbnail-size 256 256 \
   --source-downscale-long-side -1 \
   --use-full-res-thumbs \
   --exclude-white-background \

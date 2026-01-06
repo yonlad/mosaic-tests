@@ -71,7 +71,7 @@ EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
 MAX_CONCURRENT_DOWNLOADS = 50  # Maximum number of concurrent downloads
-MAX_THUMBNAIL_USAGE = 50
+MAX_THUMBNAIL_USAGE = 10
 
 def get_average_color(img):
     """Calculate the average color of an image."""
