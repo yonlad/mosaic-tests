@@ -57,11 +57,11 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (2, 2)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (480, 480)  # Much smaller for ultra-photorealistic blending (480, 480 for best print)
+INTERNAL_THUMBNAIL_SIZE = (64, 64)  # Much smaller for ultra-photorealistic blending (480, 480 for best print)
 CELL_SIZE = (2, 2)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 240  # Include almost all brightness levels
-THUMBNAIL_LIMIT = 3500  # Increased for better variety and coverage
+THUMBNAIL_LIMIT = 4000  # Increased for better variety and coverage
 SKIP_PROBABILITY = 0.0  # No skipping for complete coverage
 FOREGROUND_THRESHOLD = 0.01  # More sensitive to include faces (lowered from 0.08)
 POSITION_RANDOMNESS = 0.0  # Zero randomness for perfect grid alignment
@@ -71,7 +71,7 @@ EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
 MAX_CONCURRENT_DOWNLOADS = 50  # Maximum number of concurrent downloads
-MAX_THUMBNAIL_USAGE = 10
+MAX_THUMBNAIL_USAGE = 100
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -545,6 +545,25 @@ def fetch_thumbnails_from_s3(limit=THUMBNAIL_LIMIT, prefix=FOLDER):
         
     return thumbnails
 
+def detect_background_color(image, sample_margin=0.05):
+    """Detect the dominant background color by sampling the image edges."""
+    rgb_array = np.array(image)
+    h, w = rgb_array.shape[:2]
+    margin_y = max(1, int(h * sample_margin))
+    margin_x = max(1, int(w * sample_margin))
+
+    edge_pixels = np.concatenate([
+        rgb_array[:margin_y, :].reshape(-1, 3),       # top
+        rgb_array[-margin_y:, :].reshape(-1, 3),      # bottom
+        rgb_array[:, :margin_x].reshape(-1, 3),       # left
+        rgb_array[:, -margin_x:].reshape(-1, 3),      # right
+    ], axis=0)
+
+    bg_color = np.median(edge_pixels, axis=0).astype(int)
+    print(f"Detected background color (median of edges): {bg_color}")
+    return bg_color
+
+
 def create_mosaic(img, thumbnails):
     """Create a photorealistic mosaic of the input image using the provided thumbnails."""
     try:
@@ -567,6 +586,9 @@ def create_mosaic(img, thumbnails):
             
         # Save a copy of the original image for reference and color matching
         original_img = img.copy()
+
+        # Detect the background color before any processing
+        bg_color = detect_background_color(original_img)
         
         # Detect foreground mask BEFORE any processing
         print("Detecting foreground vs background...")
@@ -608,7 +630,7 @@ def create_mosaic(img, thumbnails):
         hi_res_height = int(mosaic_height * scale_factor)
         
         # Create the high-resolution canvas - use neon green background
-        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (57, 255, 20))
+        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (194, 189, 186))
         
         filled_cells = 0
         total_cells = n_cols * n_rows
@@ -674,6 +696,25 @@ def create_mosaic(img, thumbnails):
             cell_foreground_flags.append(row_foreground)
         
         print(f"Found {foreground_cells} foreground cells out of {total_cells} total cells")
+
+        # --- Halo removal: drop foreground cells whose colour is too
+        #     close to the detected background colour.  This prevents the
+        #     thin ring of washed-out thumbnails that appears when the
+        #     mask slightly over-extends into a bright background.
+        bg_color_f = bg_color.astype(float)
+        halo_distance_threshold = 40.0  # Euclidean RGB distance
+        halo_removed = 0
+        for y in range(n_rows):
+            for x in range(n_cols):
+                if not cell_foreground_flags[y][x]:
+                    continue
+                cell_color_f = cell_colors[y][x].astype(float)
+                dist = np.sqrt(np.sum((cell_color_f - bg_color_f) ** 2))
+                if dist < halo_distance_threshold:
+                    cell_foreground_flags[y][x] = False
+                    halo_removed += 1
+        if halo_removed:
+            print(f"Halo removal: reclassified {halo_removed} near-background cells as background")
         
         # Release the source images from memory
         del enhanced_img
@@ -865,11 +906,11 @@ def main():
     # Declare globals at the beginning of the function
     global THUMBNAIL_SIZE, INTERNAL_THUMBNAIL_SIZE, CELL_SIZE, CONTRAST_FACTOR
     global BRIGHTNESS_THRESHOLD, THUMBNAIL_LIMIT, SKIP_PROBABILITY
-    global FOREGROUND_THRESHOLD, POSITION_RANDOMNESS, DETAIL_SENSITIVITY
+    global FOREGROUND_THRESHOLD, POSITION_RANDOMNESS,  DETAIL_SENSITIVITY
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate  a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='capture_20251204_132028.jpg', 
+    parser.add_argument('--image', type=str, default='2.png', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')

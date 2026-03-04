@@ -1,0 +1,18 @@
+{
+  "blend_number": 4,
+  "bucket": "pistoletto.moe4",
+  "table": "eternity-mirror-blends-4",
+  "mode": "all",
+  "dry_run": true,
+  "started_at": "2026-02-25T20:54:02.871135+00:00",
+  "total_s3_objects": 1896,
+  "total_dynamo_rows": 100,
+  "orphan_count": 0,
+  "deletion": {
+    "deleted": 0,
+    "failed": 0,
+    "errors": []
+  },
+  "finished_at": "2026-02-25T20:54:02.871158+00:00",
+  "orphan_details": []
+}
