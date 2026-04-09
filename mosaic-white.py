@@ -12,9 +12,12 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageCms
 from functools import lru_cache
 import numpy as np
 
-# Path to the AdobeRGB 1998 ICC profile shipped with macOS. Override via
-# --icc-profile if running on another OS or bundling a custom profile.
-DEFAULT_ADOBERGB_PATH = "/System/Library/ColorSync/Profiles/AdobeRGB1998.icc"
+# AdobeRGB 1998 ICC profile bundled with the repo so this works identically on
+# macOS and Linux (the latter doesn't ship AdobeRGB via any free apt package).
+# Override via --icc-profile to point at a different profile, or pass "none"
+# to disable color conversion entirely.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_ADOBERGB_PATH = os.path.join(SCRIPT_DIR, "assets", "icc", "AdobeRGB1998.icc")
 
 # Add HEIC support
 try:
