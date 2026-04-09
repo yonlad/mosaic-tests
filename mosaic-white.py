@@ -949,7 +949,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate  a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='new-stef.png', 
+    parser.add_argument('--image', type=str, default='source.jpg', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')
