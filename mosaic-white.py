@@ -8,8 +8,13 @@ import gc
 import boto3
 from dotenv import load_dotenv
 from io import BytesIO
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageCms
+from functools import lru_cache
 import numpy as np
+
+# Path to the AdobeRGB 1998 ICC profile shipped with macOS. Override via
+# --icc-profile if running on another OS or bundling a custom profile.
+DEFAULT_ADOBERGB_PATH = "/System/Library/ColorSync/Profiles/AdobeRGB1998.icc"
 
 # Add HEIC support
 try:
@@ -829,45 +834,79 @@ def create_mosaic(img, thumbnails):
         print(traceback.format_exc())
         raise
 
-def save_mosaic(mosaic, output_path, format="JPEG", quality=75, max_tiff_dimension=20000):
+@lru_cache(maxsize=4)
+def load_icc_profile(path):
+    """Load an ICC profile from disk, cached. Returns None if unavailable or disabled."""
+    if path is None or str(path).strip().lower() == "none":
+        return None
+    try:
+        return ImageCms.getOpenProfile(path)
+    except (FileNotFoundError, OSError, ImageCms.PyCMSError) as e:
+        print(f"Warning: ICC profile not found at {path} ({e}); outputs will be untagged sRGB")
+        return None
+
+
+def convert_to_adobergb(mosaic, target_profile):
+    """Convert an implicit-sRGB mosaic to the given target color profile in place.
+
+    The mosaic is created at line ~639 via Image.new('RGB', ...) from untagged
+    thumbnail data, which PIL treats as implicit sRGB. We assume sRGB as the
+    source space here. Returns (mosaic, icc_profile_bytes_or_None).
+    """
+    if target_profile is None:
+        return mosaic, None
+    if mosaic.mode != 'RGB':
+        mosaic = mosaic.convert('RGB')
+    src_profile = ImageCms.createProfile("sRGB")
+    transform = ImageCms.buildTransformFromOpenProfiles(
+        src_profile, target_profile, "RGB", "RGB",
+        renderingIntent=ImageCms.Intent.PERCEPTUAL,
+    )
+    ImageCms.applyTransform(mosaic, transform, inPlace=True)
+    return mosaic, target_profile.tobytes()
+
+
+def save_mosaic(mosaic, output_path, format="JPEG", quality=75,
+                max_tiff_dimension=60000, icc_profile_bytes=None,
+                dpi=(300, 300)):
     """Save the mosaic to a file with specified format and compression."""
     try:
         # Make sure the directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
+
         # Check if image is too large for TIFF format
         width, height = mosaic.size
         estimated_size_gb = (width * height * 3) / (1024 * 1024 * 1024)  # RGB bytes to GB
-        
+
         if format.upper() == "TIFF":
-            # Check if image is too large for TIFF
-            if width > max_tiff_dimension or height > max_tiff_dimension or estimated_size_gb > 3.5:
+            # Check if image is too large for TIFF (BigTIFF raises the 4GB ceiling)
+            if width > max_tiff_dimension or height > max_tiff_dimension or estimated_size_gb > 8.0:
                 print(f"Warning: Image too large for TIFF ({width}x{height}, ~{estimated_size_gb:.1f}GB)")
                 print(f"Skipping TIFF save to avoid errors. Consider using PNG instead.")
                 return False
-        
+
+        # Shared kwargs: color profile and DPI metadata go into every format
+        save_kwargs = {"format": format, "dpi": dpi}
+        if icc_profile_bytes:
+            save_kwargs["icc_profile"] = icc_profile_bytes
+
         # Save with format-specific settings
         if format.upper() == "JPEG":
-            mosaic.save(output_path, format=format, quality=quality, optimize=True, progressive=True)
+            mosaic.save(output_path, quality=quality, optimize=True, progressive=True, **save_kwargs)
         elif format.upper() == "PNG":
-            # PNG supports lossless compression with optimize
-            # For very large images, disable optimization to avoid memory issues
-            if estimated_size_gb > 2.0:
-                print(f"Large image detected ({estimated_size_gb:.1f}GB), using basic PNG compression")
-                mosaic.save(output_path, format=format, optimize=False)
-            else:
-                mosaic.save(output_path, format=format, optimize=True)
+            # PNG supports lossless compression with optimize. For very large
+            # images, disable optimization to avoid memory issues.
+            mosaic.save(output_path, optimize=(estimated_size_gb <= 2.0), **save_kwargs)
         elif format.upper() == "TIFF":
-            # Use different compression for large images
-            if estimated_size_gb > 1.0:
-                print(f"Using JPEG compression within TIFF for large image")
-                mosaic.save(output_path, format=format, compression='jpeg', quality=85)
-            else:
-                mosaic.save(output_path, format=format, compression='lzw')
+            # Lossless LZW — this is the print deliverable, so never use JPEG-in-TIFF.
+            tiff_kwargs = dict(save_kwargs, compression="tiff_lzw")
+            if estimated_size_gb > 3.5:
+                tiff_kwargs["bigtiff"] = True
+            mosaic.save(output_path, **tiff_kwargs)
         else:
             # Default save for other formats
-            mosaic.save(output_path, format=format)
-            
+            mosaic.save(output_path, **save_kwargs)
+
         print(f"Mosaic saved to {output_path} as {format}")
         return True
     except Exception as e:
@@ -940,10 +979,14 @@ def main():
                         help='Align thumbnails with detected edges')
     parser.add_argument('--min-thumbnail-scale', type=float, default=MIN_THUMBNAIL_SCALE,
                         help='Minimum scale factor for thumbnails in detailed areas')
-    parser.add_argument('--max-tiff-dimension', type=int, default=20000,
-                        help='Maximum width/height for TIFF files (default: 20000)')
-    parser.add_argument('--skip-tiff', action='store_true', default=True,
-                        help='Skip TIFF format entirely (useful for very large mosaics)')
+    parser.add_argument('--max-tiff-dimension', type=int, default=60000,
+                        help='Maximum width/height for TIFF files (default: 60000)')
+    parser.add_argument('--skip-tiff', action=argparse.BooleanOptionalAction, default=False,
+                        help='Skip TIFF output (TIFF is the print deliverable; default: write it)')
+    parser.add_argument('--icc-profile', type=str, default=DEFAULT_ADOBERGB_PATH,
+                        help='Path to ICC profile to embed, or "none" to disable color conversion')
+    parser.add_argument('--dpi', type=int, default=300,
+                        help='DPI metadata embedded in saved files (default: 300)')
     
     args = parser.parse_args()
     
@@ -1017,28 +1060,41 @@ def main():
     width, height = mosaic.size
     estimated_size_gb = (width * height * 3) / (1024 * 1024 * 1024)
     print(f"Final mosaic size: {width}x{height} pixels (~{estimated_size_gb:.1f}GB uncompressed)")
-    
+
+    # Color management: convert implicit sRGB -> target profile (AdobeRGB by default)
+    # and embed the profile bytes in every saved file. Done once so all three
+    # output formats share the same converted pixels (avoids multi-GB duplication).
+    target_profile = load_icc_profile(args.icc_profile)
+    if target_profile is not None:
+        print(f"Converting mosaic to embedded ICC profile: {args.icc_profile}")
+    mosaic, icc_bytes = convert_to_adobergb(mosaic, target_profile)
+    dpi_tuple = (args.dpi, args.dpi)
+
     # Save as TIFF (lossless, high quality) - with size check
     tiff_success = False
     if not args.skip_tiff:
         tiff_filename = f"mosaic_{timestamp}.tiff"
         tiff_path = os.path.join("output", tiff_filename)
-        tiff_success = save_mosaic(mosaic, tiff_path, format="TIFF", max_tiff_dimension=args.max_tiff_dimension)
+        tiff_success = save_mosaic(mosaic, tiff_path, format="TIFF",
+                                   max_tiff_dimension=args.max_tiff_dimension,
+                                   icc_profile_bytes=icc_bytes, dpi=dpi_tuple)
         if not tiff_success:
             print("TIFF save skipped due to size limitations")
     else:
         print("TIFF save skipped (--skip-tiff flag used)")
         tiff_path = "N/A"
-    
+
     # Save as PNG (lossless, smaller than TIFF)
     png_filename = f"mosaic_{timestamp}.png"
     png_path = os.path.join("output", png_filename)
-    png_success = save_mosaic(mosaic, png_path, format="PNG")
-    
+    png_success = save_mosaic(mosaic, png_path, format="PNG",
+                              icc_profile_bytes=icc_bytes, dpi=dpi_tuple)
+
     # Save as JPEG for compatibility and smaller file size
     jpg_filename = f"mosaic_{timestamp}.jpg"
     jpg_path = os.path.join("output", jpg_filename)
-    jpg_success = save_mosaic(mosaic, jpg_path, format="JPEG", quality=75)
+    jpg_success = save_mosaic(mosaic, jpg_path, format="JPEG", quality=95,
+                              icc_profile_bytes=icc_bytes, dpi=dpi_tuple)
     
     
     # Summary of saved files
