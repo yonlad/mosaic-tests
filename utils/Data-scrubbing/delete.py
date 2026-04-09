@@ -152,8 +152,26 @@ def main():
         print("Manifest contains no items. Nothing to do.")
         sys.exit(0)
 
-    s3_keys = [it["s3_key"] for it in items]
-    blend_ids = sorted({bid for it in items for bid in it.get("blend_ids", [])})
+    # Support both manifest formats:
+    #   review.py:        items[].s3_key  + items[].blend_ids[]
+    #   review_blends.py: items[].blend_id + items[].source_image_key/random_image_key/s3_video_key
+    is_blend_manifest = "blend_id" in (items[0] if items else {})
+
+    if is_blend_manifest:
+        # Collect all S3 keys (source, random, video) and blend_ids
+        s3_keys = []
+        blend_ids = []
+        for it in items:
+            if it.get("blend_id"):
+                blend_ids.append(it["blend_id"])
+            for field in ("source_image_key", "random_image_key", "s3_video_key"):
+                val = it.get(field, "")
+                if val and val not in s3_keys:
+                    s3_keys.append(val)
+        blend_ids = sorted(set(blend_ids))
+    else:
+        s3_keys = [it["s3_key"] for it in items]
+        blend_ids = sorted({bid for it in items for bid in it.get("blend_ids", [])})
 
     mode_label = "[DRY-RUN] " if args.dry_run else ""
 

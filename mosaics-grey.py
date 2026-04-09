@@ -44,7 +44,7 @@ AWS_REGION = os.getenv('REACT_APP_AWS_REGION', 'us-east-2')
 AWS_ACCESS_KEY_ID = os.getenv('REACT_APP_AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('REACT_APP_AWS_SECRET_ACCESS_KEY')
 # S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
-S3_BUCKET = 'pistoletto.moe3'
+S3_BUCKET = 'pistoletto.sanitized'
 FOLDER = 'selected-images/'
 
 # Initialize S3 client
@@ -71,7 +71,7 @@ EDGE_ALIGNMENT = False  # Disable rotation for cleaner grid appearance
 MIN_THUMBNAIL_SCALE = 0.8  # Larger minimum for better coverage
 MAX_THUMBNAIL_SCALE = 1.0  # Maximum scale factor for thumbnails
 MAX_CONCURRENT_DOWNLOADS = 50  # Maximum number of concurrent downloads
-MAX_THUMBNAIL_USAGE = 100
+MAX_THUMBNAIL_USAGE = 50
 
 def get_average_color(img):
     """Calculate the average color of an image."""
@@ -910,7 +910,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate  a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='2.png', 
+    parser.add_argument('--image', type=str, default='miami-wm.jpg', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')

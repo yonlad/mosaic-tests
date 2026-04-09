@@ -630,7 +630,7 @@ def create_mosaic(img, thumbnails):
         hi_res_height = int(mosaic_height * scale_factor)
         
         # Create the high-resolution canvas - use neon green background
-        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (57, 255, 20))
+        mosaic = Image.new('RGB', (hi_res_width, hi_res_height), (255, 255, 255))
         
         filled_cells = 0
         total_cells = n_cols * n_rows

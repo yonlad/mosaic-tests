@@ -31,7 +31,7 @@ from PIL import Image
 from dotenv import load_dotenv
 
 # Load .env from project root (one level up from utils/)
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"))
 
 # ---------------------------------------------------------------------------
 # Configuration from .env
@@ -394,6 +394,8 @@ def blend_images(
         ext = ext or ".png"
         saved_paths: list[str] = []
 
+        os.makedirs(os.path.dirname(os.path.abspath(f"{base}_01{ext}")), exist_ok=True)
+
         for i, frame in enumerate(frames, start=1):
             frame_label = f"frame {i}/{len(frames)}"
 
@@ -426,9 +428,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Blend two images via the Flora API.")
-    parser.add_argument("-image1", default="utils/1.jpg", help="Path to the first image")
-    parser.add_argument("-image2", default="utils/2.png", help="Path to the second image")
-    parser.add_argument("-o", "--output", default="utils/blended_output/frame.png", help="Output PNG path")
+    parser.add_argument("-image1", default="utils/blend/1.png", help="Path to the first image")
+    parser.add_argument("-image2", default="utils/blend/2.png", help="Path to the second image")
+    parser.add_argument("-o", "--output", default="utils/blend/blended_output/frame.png", help="Output PNG path")
     parser.add_argument("-p", "--prompt", default="A medium shot photo of a person with a white background")
     parser.add_argument("-s", "--strength", type=float, default=float(random.uniform(0, 1)), help="Blend strength 0.0-1.0")
     parser.add_argument("--seed", type=int, default=random.randint(0, 1000), help="Random seed 0-1000")
