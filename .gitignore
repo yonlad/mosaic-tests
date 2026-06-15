@@ -26,4 +26,8 @@ __pycache__/
 output/
 
 
-utils/app
+utils/app/build
+utils/app/dist
+*.zip
+*.spec
+*.env
