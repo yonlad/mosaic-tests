@@ -44,7 +44,7 @@ AWS_REGION = os.getenv('REACT_APP_AWS_REGION', 'us-east-2')
 AWS_ACCESS_KEY_ID = os.getenv('REACT_APP_AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('REACT_APP_AWS_SECRET_ACCESS_KEY')
 # S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
-S3_BUCKET = 'pistoletto.sanitized'
+S3_BUCKET = 'pistoletto.test'
 FOLDER = 'selected-images/'
 
 # Initialize S3 client
@@ -910,7 +910,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate  a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='miami-wm.jpg', 
+    parser.add_argument('--image', type=str, default='photo.png', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')

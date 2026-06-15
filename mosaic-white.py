@@ -52,7 +52,7 @@ AWS_REGION = os.getenv('REACT_APP_AWS_REGION', 'us-east-2')
 AWS_ACCESS_KEY_ID = os.getenv('REACT_APP_AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('REACT_APP_AWS_SECRET_ACCESS_KEY')
 # S3_BUCKET = os.getenv('REACT_APP_S3_BUCKET', 'eternity-mirror-project')
-S3_BUCKET = 'pistoletto.sanitized'
+S3_BUCKET = 'pistoletto.test'
 FOLDER = 'selected-images/'
 
 # Initialize S3 client
@@ -65,7 +65,7 @@ s3_client = boto3.client(
 
 # Mosaic configuration - you can adjust these parameters to experiment
 THUMBNAIL_SIZE = (2, 2)  # Size for display/layout - smaller for photorealistic
-INTERNAL_THUMBNAIL_SIZE = (480, 480)  # Much smaller for ultra-photorealistic blending (480, 480 for best print)
+INTERNAL_THUMBNAIL_SIZE = (64, 64)  # Much smaller for ultra-photorealistic blending (480, 480 for best print)
 CELL_SIZE = (2, 2)  # Spacing between thumbnails (controls density) - smaller for photorealistic
 CONTRAST_FACTOR = 1.0  # Contrast enhancement disabled by default
 BRIGHTNESS_THRESHOLD = 240  # Include almost all brightness levels
@@ -952,7 +952,7 @@ def main():
     global USE_VARIABLE_SIZES, EDGE_ALIGNMENT, MIN_THUMBNAIL_SCALE
     
     parser = argparse.ArgumentParser(description='Generate  a mosaic from an image using thumbnails from S3')
-    parser.add_argument('--image', type=str, default='source.jpg', 
+    parser.add_argument('--image', type=str, default='miami-woman.png', 
                         help='Local image path or S3 key')
     parser.add_argument('--is-s3-key', action='store_true',
                         help='Flag to indicate if the image is an S3 key')

@@ -22,7 +22,7 @@ python review_blends.py --blend 2 --no-open
 # Delete Blends
 
 # Step 1 — Preview what would be deleted
-python delete.py --manifest blend_manifest_blend1_*.json --dry-run
+python delete.py --manifest blend_manifest_blend5_*.json --dry-run
 
 # Step 2 — Execute for real
-python delete.py --manifest blend_manifest_blend1_*.json
+python delete.py --manifest blend_manifest_blend5_*.json

@@ -22,3 +22,8 @@ __pycache__/
 *.pyz
 *.json
 *.html
+
+output/
+
+
+utils/app

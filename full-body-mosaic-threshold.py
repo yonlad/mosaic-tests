@@ -78,6 +78,7 @@ class MosaicConfig:
     
     # Foreground handling
     use_foreground_mask: bool = True
+    fg_mask_method: str = "otsu"  # "otsu", "rembg", or "hybrid" (otsu + rembg for dark areas)
     foreground_inclusion_bias: float = 0.15
     exclude_white_background: bool = True
     white_bg_luma_threshold: int = 245
@@ -102,6 +103,10 @@ class MosaicConfig:
     # Blending
     blend_with_source: bool = True
     blend_alpha: float = 0.12
+
+    # Post-processing: replace white pixels in the final mosaic with background color
+    replace_white_threshold: int = 0  # 0 = disabled; >0 = pixels with R,G,B all above this get replaced
+    background_color: Tuple[int, int, int] = (194, 189, 186)  # grey canvas color
 
 
 # ----------------------------
@@ -239,6 +244,47 @@ def load_source_image(cfg: MosaicConfig) -> Optional[Image.Image]:
 def detect_foreground_mask(src_rgb: np.ndarray, cfg: MosaicConfig) -> np.ndarray:
     if not cfg.use_foreground_mask:
         return np.ones((src_rgb.shape[0], src_rgb.shape[1]), dtype=bool)
+
+    if cfg.fg_mask_method == "rembg":
+        from rembg import remove as rembg_remove
+        pil_img = Image.fromarray(src_rgb)
+        result = rembg_remove(pil_img)
+        alpha = np.array(result.split()[3])
+        mask = alpha > 127
+        # Apply white exclusion on top of rembg mask (preserves shirt visibility)
+        if cfg.exclude_white_background:
+            gray = (0.299 * src_rgb[..., 0] + 0.587 * src_rgb[..., 1] + 0.114 * src_rgb[..., 2]).astype(np.float32)
+            white_bg = gray >= float(cfg.white_bg_luma_threshold)
+            mask = mask & (~white_bg)
+        if cfg.fg_mask_erosion_radius > 0:
+            from scipy.ndimage import binary_erosion
+            mask = binary_erosion(mask, iterations=cfg.fg_mask_erosion_radius)
+        if cfg.fg_mask_fill_holes:
+            mask = fill_mask_holes(mask, cfg.fg_mask_fill_holes_max_area)
+        return mask
+
+    if cfg.fg_mask_method == "hybrid":
+        # Otsu mask preserves shirts, rembg adds dark areas otsu missed (ponytail)
+        # 1. Get rembg person mask (only dark/non-white parts)
+        from rembg import remove as rembg_remove
+        pil_img = Image.fromarray(src_rgb)
+        result = rembg_remove(pil_img)
+        alpha = np.array(result.split()[3])
+        rembg_mask = alpha > 127
+        gray = (0.299 * src_rgb[..., 0] + 0.587 * src_rgb[..., 1] + 0.114 * src_rgb[..., 2]).astype(np.float32)
+        white_bg = gray >= float(cfg.white_bg_luma_threshold)
+        rembg_dark = rembg_mask & (~white_bg)  # rembg only contributes dark areas
+
+        # 2. Compute otsu mask normally (it runs below and returns)
+        # We'll compute it inline, then union
+        cfg_copy = MosaicConfig(**{**cfg.__dict__, "fg_mask_method": "otsu"})
+        otsu_mask = detect_foreground_mask(src_rgb, cfg_copy)
+
+        # 3. Union: otsu (shirts) + rembg dark areas (ponytail)
+        mask = otsu_mask | rembg_dark
+        if cfg.fg_mask_fill_holes:
+            mask = fill_mask_holes(mask, cfg.fg_mask_fill_holes_max_area)
+        return mask
 
     gray = (0.299 * src_rgb[..., 0] + 0.587 * src_rgb[..., 1] + 0.114 * src_rgb[..., 2]).astype(np.float32)
     h, w = gray.shape
@@ -611,6 +657,16 @@ def run(cfg: MosaicConfig) -> Optional[Image.Image]:
     tiles = adaptive_tile_quadtree(src_rgb, cfg, fg_mask)
     mosaic = match_and_place(src_rgb, tiles, thumbs, cfg)
 
+    # Post-processing: replace white pixels with background color
+    if cfg.replace_white_threshold > 0:
+        arr = np.array(mosaic)
+        white = (arr[:, :, 0] > cfg.replace_white_threshold) & \
+                (arr[:, :, 1] > cfg.replace_white_threshold) & \
+                (arr[:, :, 2] > cfg.replace_white_threshold)
+        arr[white] = cfg.background_color
+        mosaic = Image.fromarray(arr)
+        print(f"Replaced {white.sum()} white pixels (threshold={cfg.replace_white_threshold}) with {cfg.background_color}")
+
     os.makedirs(cfg.output_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_ext = "jpg" if cfg.output_format.upper() in ("JPG", "JPEG") else cfg.output_format.lower()
@@ -653,7 +709,10 @@ def _parse_args() -> MosaicConfig:
     p.add_argument("--reuse-penalty", type=float, default=MosaicConfig.reuse_penalty)
     p.add_argument("--max-thumbnail-usage", type=int, default=MosaicConfig.max_thumbnail_usage)
     p.add_argument("--color-space", type=str, default=MosaicConfig.color_space, choices=["lab", "rgb"])
-    p.add_argument("--exclude-white-background", action="store_true", default=MosaicConfig.exclude_white_background)
+    p.add_argument("--fg-mask-method", type=str, default=MosaicConfig.fg_mask_method, choices=["otsu", "rembg", "hybrid"])
+    p.add_argument("--exclude-white-background", dest="exclude_white_background", action="store_true")
+    p.add_argument("--no-exclude-white-background", dest="exclude_white_background", action="store_false")
+    p.set_defaults(exclude_white_background=MosaicConfig.exclude_white_background)
     p.add_argument("--white-bg-luma-threshold", type=int, default=MosaicConfig.white_bg_luma_threshold)
     p.add_argument("--fg-mask-erosion-radius", type=int, default=MosaicConfig.fg_mask_erosion_radius)
     p.add_argument("--no-fg-mask-fill-holes", dest="fg_mask_fill_holes", action="store_false")
@@ -675,6 +734,10 @@ def _parse_args() -> MosaicConfig:
     p.add_argument("--save-thumbnail", action="store_true", default=MosaicConfig.save_thumbnail)
     p.add_argument("--no-blend", action="store_true")
     p.add_argument("--blend-alpha", type=float, default=MosaicConfig.blend_alpha)
+    p.add_argument("--replace-white-threshold", type=int, default=MosaicConfig.replace_white_threshold,
+                   help="Replace white pixels (R,G,B > threshold) with background color. 0 = disabled (default: 0)")
+    p.add_argument("--background-color", type=int, nargs=3, default=list(MosaicConfig.background_color),
+                   help="RGB background color for white replacement (default: 194 189 186)")
     p.add_argument("--output-long-side", type=int, default=MosaicConfig.output_long_side)
     p.add_argument(
         "--source-downscale-long-side",
@@ -707,6 +770,7 @@ def _parse_args() -> MosaicConfig:
         reuse_penalty=args.reuse_penalty,
         max_thumbnail_usage=args.max_thumbnail_usage,
         color_space=args.color_space,
+        fg_mask_method=args.fg_mask_method,
         exclude_white_background=args.exclude_white_background,
         white_bg_luma_threshold=args.white_bg_luma_threshold,
         fg_mask_erosion_radius=args.fg_mask_erosion_radius,
@@ -725,6 +789,8 @@ def _parse_args() -> MosaicConfig:
         source_downscale_long_side=args.source_downscale_long_side,
         max_source_image_pixels=args.max_source_image_pixels,
         create_grey_background=args.create_grey_background,
+        replace_white_threshold=args.replace_white_threshold,
+        background_color=tuple(args.background_color),
     )
     return cfg
 
