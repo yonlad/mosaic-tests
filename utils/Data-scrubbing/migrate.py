@@ -32,7 +32,15 @@ SANITIZED_BUCKET = BLENDS[5]["bucket"]  # pistoletto.sanitized
 REVIEWED_PREFIX = "selected-images/reviewed-images/"
 MANIFEST_DIR = Path(__file__).resolve().parent / "reviewed_assets"
 CENTRAL_TABLE = "eternity-mirror-blends-central"
-S3_URL_BASE = f"https://s3.us-east-2.amazonaws.com/{SANITIZED_BUCKET}/"
+AWS_REGION = "us-east-2"
+S3_URL_BASE = f"https://s3.{AWS_REGION}.amazonaws.com/{SANITIZED_BUCKET}/"
+
+SYSTEM_MAP = {
+    "pistoletto.moe": 1,
+    "pistoletto.moe2": 2,
+    "pistoletto.moe3": 3,
+    "pistoletto.moe4": 4,
+}
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -104,6 +112,26 @@ def load_flagged_keys(manifest_dir: Path) -> dict[str, set[str]]:
                 keys.add(s3_key)
         print(f"  Loaded {len(data.get('items', []))} flagged keys from {f.name} (bucket: {bucket})")
     return flagged
+
+
+def strip_bucket_prefix(raw_key: str) -> str:
+    """Strip any leading bucket-name prefix from an S3 key.
+
+    DynamoDB sometimes stores keys like 'pistoletto.moe3/selected-images/...'
+    while the actual S3 key is just 'selected-images/...'.
+    """
+    for bucket_name in SYSTEM_MAP:
+        prefix = bucket_name + "/"
+        if raw_key.startswith(prefix):
+            return raw_key[len(prefix):]
+    if raw_key.startswith(SANITIZED_BUCKET + "/"):
+        return raw_key[len(SANITIZED_BUCKET) + 1:]
+    return raw_key
+
+
+def public_url(bucket: str, key: str) -> str:
+    """Build a plain public S3 URL (no signature, no expiry)."""
+    return f"https://s3.{AWS_REGION}.amazonaws.com/{bucket}/{key}"
 
 
 def list_s3_images(s3, bucket: str, prefix: str = IMAGE_PREFIX) -> list[str]:
@@ -537,6 +565,232 @@ def run_audit_system4(args):
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: migrate-sources
+# ---------------------------------------------------------------------------
+
+def run_migrate_sources(args):
+    """Migrate source images to sanitized bucket and convert all URLs to public format."""
+    s3 = get_s3_client()
+    dynamodb = get_dynamodb_resource()
+    table = dynamodb.Table(CENTRAL_TABLE)
+    dry_run = args.dry_run
+    mode = "[DRY-RUN] " if dry_run else ""
+
+    # Scan central table
+    print(f"Scanning {CENTRAL_TABLE}...")
+    db_items: list[dict] = []
+    scan_kwargs: dict = {}
+    while True:
+        resp = table.scan(**scan_kwargs)
+        db_items.extend(resp.get("Items", []))
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            break
+        scan_kwargs["ExclusiveStartKey"] = last
+    print(f"  Found {len(db_items)} records")
+
+    # List existing assets in sanitized bucket
+    print(f"\nListing existing assets in {SANITIZED_BUCKET}...")
+    existing_keys = set(list_s3_images(s3, SANITIZED_BUCKET))
+    print(f"  Found {len(existing_keys)} existing assets")
+
+    # Phase 1: Copy missing source images to sanitized bucket
+    print(f"\n{'='*60}")
+    print(f"  {mode}Phase 1: Copy source images to sanitized bucket")
+    print(f"{'='*60}")
+
+    copied = 0
+    already_exists = 0
+    copy_failed: list[dict] = []
+    skipped_no_uuid = 0
+
+    for item in db_items:
+        sib = item.get("source_image_bucket", "")
+        sik = item.get("source_image_key", "")
+        if not sib or not sik:
+            continue
+
+        sys_num = SYSTEM_MAP.get(sib)
+        if not sys_num:
+            continue
+
+        bare_key = strip_bucket_prefix(sik)
+        parts = bare_key.split("/")
+
+        # Find UUID and filename
+        uuid_part = None
+        for p in parts:
+            if UUID_RE.match(p):
+                uuid_part = p
+                break
+        if not uuid_part:
+            skipped_no_uuid += 1
+            continue
+
+        filename = parts[-1]
+        dest_key = f"selected-images/system-{sys_num}/{uuid_part}/{filename}"
+
+        if dest_key in existing_keys:
+            already_exists += 1
+            continue
+
+        if dry_run:
+            copied += 1
+        else:
+            try:
+                s3.copy_object(
+                    Bucket=SANITIZED_BUCKET,
+                    Key=dest_key,
+                    CopySource={"Bucket": sib, "Key": bare_key},
+                )
+                existing_keys.add(dest_key)
+                copied += 1
+            except Exception as e:
+                print(f"  FAILED: {sib}/{bare_key} -> {e}")
+                copy_failed.append({"source": f"{sib}/{bare_key}", "dest": dest_key, "error": str(e)})
+
+        if copied % 100 == 0 and copied > 0:
+            print(f"  {'Would copy' if dry_run else 'Copied'} {copied}...")
+
+    print(f"\n  {mode}Phase 1 summary:")
+    print(f"    Already in sanitized: {already_exists}")
+    print(f"    Copied: {copied}")
+    print(f"    Failed: {len(copy_failed)}")
+    print(f"    Skipped (no UUID): {skipped_no_uuid}")
+
+    if copy_failed:
+        print(f"\n  WARNING: {len(copy_failed)} copies failed — skipping DynamoDB updates for those records.")
+
+    # Phase 2: Update all DynamoDB records — redirect source refs + convert all URLs to public
+    print(f"\n{'='*60}")
+    print(f"  {mode}Phase 2: Update DynamoDB records (redirect + public URLs)")
+    print(f"{'='*60}")
+
+    updated = 0
+    update_failed: list[dict] = []
+    failed_sources = {f["source"] for f in copy_failed}
+
+    for item in db_items:
+        blend_id = item["blend_id"]
+        sib = item.get("source_image_bucket", "")
+        sik = item.get("source_image_key", "")
+        rib = item.get("random_image_bucket", "")
+        rik = item.get("random_image_key", "")
+
+        # Build the new source key in sanitized
+        new_source_key = None
+        sys_num = SYSTEM_MAP.get(sib)
+        if sys_num and sik:
+            bare_key = strip_bucket_prefix(sik)
+            parts = bare_key.split("/")
+            uuid_part = None
+            for p in parts:
+                if UUID_RE.match(p):
+                    uuid_part = p
+                    break
+            if uuid_part:
+                filename = parts[-1]
+                new_source_key = f"selected-images/system-{sys_num}/{uuid_part}/{filename}"
+
+                # Skip if the copy failed for this asset
+                if f"{sib}/{bare_key}" in failed_sources:
+                    continue
+
+        # Build the bare random key
+        new_random_key = strip_bucket_prefix(rik) if rik else rik
+
+        # Build update expression
+        updates = {}
+        names = {}
+        values = {}
+        idx = 0
+
+        # Source image: redirect to sanitized
+        if new_source_key:
+            updates[f"#f{idx}"] = f":v{idx}"
+            names[f"#f{idx}"] = "source_image_key"
+            values[f":v{idx}"] = new_source_key
+            idx += 1
+            updates[f"#f{idx}"] = f":v{idx}"
+            names[f"#f{idx}"] = "source_image_bucket"
+            values[f":v{idx}"] = SANITIZED_BUCKET
+            idx += 1
+            updates[f"#f{idx}"] = f":v{idx}"
+            names[f"#f{idx}"] = "source_image_url"
+            values[f":v{idx}"] = public_url(SANITIZED_BUCKET, new_source_key)
+            idx += 1
+
+        # Random image URL: convert to public
+        if rik and rib:
+            target_bucket = SANITIZED_BUCKET if rib == SANITIZED_BUCKET else rib
+            updates[f"#f{idx}"] = f":v{idx}"
+            names[f"#f{idx}"] = "random_image_url"
+            values[f":v{idx}"] = public_url(target_bucket, new_random_key)
+            idx += 1
+            # Also normalize the key (strip bucket prefix if present)
+            if rik != new_random_key:
+                updates[f"#f{idx}"] = f":v{idx}"
+                names[f"#f{idx}"] = "random_image_key"
+                values[f":v{idx}"] = new_random_key
+                idx += 1
+
+        # Video URLs: convert to public
+        for video_field, url_field in [("s3_key", "blend_url"), ("s3_key", "video_url"), ("s3_key", "videoUrl")]:
+            video_key = item.get("s3_video_key", "") or item.get("s3_key", "")
+            old_url = item.get(url_field, "")
+            if old_url and video_key:
+                blend_bucket = item.get("blend_bucket", sib)
+                bare_video = strip_bucket_prefix(video_key)
+                updates[f"#f{idx}"] = f":v{idx}"
+                names[f"#f{idx}"] = url_field
+                values[f":v{idx}"] = public_url(blend_bucket, bare_video)
+                idx += 1
+
+        if not updates:
+            continue
+
+        expr = "SET " + ", ".join(f"{k} = {v}" for k, v in updates.items())
+
+        if dry_run:
+            updated += 1
+        else:
+            try:
+                table.update_item(
+                    Key={"blend_id": blend_id},
+                    UpdateExpression=expr,
+                    ExpressionAttributeNames=names,
+                    ExpressionAttributeValues=values,
+                )
+                updated += 1
+            except Exception as e:
+                print(f"  FAILED updating {blend_id}: {e}")
+                update_failed.append({"blend_id": blend_id, "error": str(e)})
+
+        if updated % 200 == 0 and updated > 0:
+            print(f"  {'Would update' if dry_run else 'Updated'} {updated}...")
+
+    print(f"\n  {mode}Phase 2 summary:")
+    print(f"    Records updated: {updated}")
+    print(f"    Update failures: {len(update_failed)}")
+
+    # Write log
+    log = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "dry_run": dry_run,
+        "phase1_copied": copied,
+        "phase1_already_exists": already_exists,
+        "phase1_failed": len(copy_failed),
+        "phase1_failed_items": copy_failed,
+        "phase2_updated": updated,
+        "phase2_failed": len(update_failed),
+        "phase2_failed_items": update_failed,
+    }
+    log_path = Path(__file__).resolve().parent / f"migrate_sources_log_{int(datetime.now().timestamp())}.json"
+    log_path.write_text(json.dumps(log, indent=2, default=str), encoding="utf-8")
+    print(f"\nLog saved to: {log_path}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -561,6 +815,11 @@ def parse_args():
     ded.add_argument("--clean", action="store_true", help="Delete duplicate copies (keeps reviewed-images)")
     ded.add_argument("--dry-run", action="store_true", help="Preview without deleting")
 
+    # migrate-sources
+    ms = sub.add_parser("migrate-sources",
+                        help="Migrate source images to sanitized bucket + convert URLs to public")
+    ms.add_argument("--dry-run", action="store_true", help="Preview without changes")
+
     # audit-system4
     sub.add_parser("audit-system4", help="Diagnostic report of system 4 coverage")
 
@@ -573,6 +832,8 @@ def main():
         run_migrate(args)
     elif args.command == "dedup":
         run_dedup(args)
+    elif args.command == "migrate-sources":
+        run_migrate_sources(args)
     elif args.command == "audit-system4":
         run_audit_system4(args)
 
