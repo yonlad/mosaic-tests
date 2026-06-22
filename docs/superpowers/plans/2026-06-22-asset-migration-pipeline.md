@@ -1,3 +1,175 @@
+# Asset Migration Pipeline Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build `migrate.py` in `utils/data-scrubbing/` with three subcommands (migrate, dedup, audit-system4) to copy verified good assets to the centralized sanitized bucket, detect duplicates, and audit system 4 coverage.
+
+**Architecture:** Single Python script with argparse subcommands, reusing the shared `config.py` for AWS clients and bucket mappings. Pure helper functions handle filtering logic (UUID validation, date parsing, manifest loading). Each subcommand produces JSON logs consistent with the existing `delete.py` patterns.
+
+**Tech Stack:** Python 3.10+, boto3 (via existing config.py), pytest for unit tests
+
+## Global Constraints
+
+- Reuse `config.py` for all AWS access — do not duplicate credentials or client factories
+- Image extensions: `{"jpg", "jpeg", "png", "webp", "tiff", "tif"}` (from `config.IMAGE_EXTENSIONS`)
+- S3 prefix: `selected-images/` (from `config.IMAGE_PREFIX`)
+- Destination bucket: `pistoletto.sanitized` (BLENDS[5])
+- Reviewed assets destination prefix: `selected-images/reviewed-images/system-{1,2,3}/<uuid>/<filename>`
+- Manifest directory: `utils/data-scrubbing/reviewed_assets/`
+- All scripts run from `utils/data-scrubbing/` directory
+- JSON logs written to `utils/data-scrubbing/` directory
+
+---
+
+### Task 1: Shared Helper Functions + Unit Tests
+
+**Files:**
+- Create: `utils/data-scrubbing/migrate.py` (helpers only, no subcommands yet)
+- Create: `utils/data-scrubbing/test_migrate.py`
+
+**Interfaces:**
+- Produces:
+  - `is_participant_session(folder_name: str) -> bool`
+  - `parse_capture_date(filename: str) -> date | None`
+  - `extract_dedup_key(s3_key: str) -> str | None`
+  - `load_flagged_keys(manifest_dir: Path) -> dict[str, set[str]]`
+  - `list_s3_images(s3, bucket: str, prefix: str) -> list[str]`
+  - Constants: `SANITIZED_BUCKET`, `REVIEWED_PREFIX`, `UUID_RE`, `CAPTURE_DATE_RE`, `DEFAULT_RANGES`, `MANIFEST_DIR`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `utils/data-scrubbing/test_migrate.py`:
+
+```python
+#!/usr/bin/env python3
+"""Unit tests for migrate.py helper functions."""
+
+import json
+import tempfile
+from datetime import date
+from pathlib import Path
+
+from migrate import (
+    is_participant_session,
+    parse_capture_date,
+    extract_dedup_key,
+    load_flagged_keys,
+)
+
+
+class TestIsParticipantSession:
+    def test_valid_uuid(self):
+        assert is_participant_session("31dc9a6b-04c0-4a95-8450-56db0cd90d34") is True
+
+    def test_zero_uuid(self):
+        assert is_participant_session("00000000-0000-0000-0000-000000000000") is True
+
+    def test_resized_white_bg(self):
+        assert is_participant_session("resized_white_bg") is False
+
+    def test_resized_black_bg(self):
+        assert is_participant_session("resized_black_bg") is False
+
+    def test_flora_screenshot(self):
+        assert is_participant_session("flora-screenshot") is False
+
+    def test_empty_string(self):
+        assert is_participant_session("") is False
+
+    def test_uppercase_uuid_rejected(self):
+        assert is_participant_session("31DC9A6B-04C0-4A95-8450-56DB0CD90D34") is False
+
+
+class TestParseCaptureDate:
+    def test_standard_filename(self):
+        assert parse_capture_date("capture_20260607_071909.jpg") == date(2026, 6, 7)
+
+    def test_new_year(self):
+        assert parse_capture_date("capture_20260101_000000.jpg") == date(2026, 1, 1)
+
+    def test_no_capture_prefix(self):
+        assert parse_capture_date("random_file.jpg") is None
+
+    def test_invalid_date_digits(self):
+        assert parse_capture_date("capture_99991399_000000.jpg") is None
+
+    def test_bg_removed_suffix(self):
+        assert parse_capture_date("capture_20250628_133311_bg_removed_fit.jpg") == date(2025, 6, 28)
+
+
+class TestExtractDedupKey:
+    def test_standard_path(self):
+        key = "selected-images/31dc9a6b-04c0-4a95-8450-56db0cd90d34/capture_20260606_071909.jpg"
+        assert extract_dedup_key(key) == "31dc9a6b-04c0-4a95-8450-56db0cd90d34/capture_20260606_071909.jpg"
+
+    def test_system_path(self):
+        key = "selected-images/system-1/31dc9a6b-04c0-4a95-8450-56db0cd90d34/capture_20260606_071909.jpg"
+        assert extract_dedup_key(key) == "31dc9a6b-04c0-4a95-8450-56db0cd90d34/capture_20260606_071909.jpg"
+
+    def test_reviewed_path(self):
+        key = "selected-images/reviewed-images/system-1/31dc9a6b-04c0-4a95-8450-56db0cd90d34/capture_20260606_071909.jpg"
+        assert extract_dedup_key(key) == "31dc9a6b-04c0-4a95-8450-56db0cd90d34/capture_20260606_071909.jpg"
+
+    def test_no_uuid_returns_none(self):
+        key = "selected-images/resized_white_bg/capture_20250628_133311_bg_removed_fit.jpg"
+        assert extract_dedup_key(key) is None
+
+
+class TestLoadFlaggedKeys:
+    def test_loads_manifests(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = {
+                "bucket": "pistoletto.moe",
+                "items": [
+                    {"s3_key": "selected-images/abc/capture_1.jpg", "blend_ids": []},
+                    {"s3_key": "selected-images/def/capture_2.jpg", "blend_ids": ["b1"]},
+                ],
+            }
+            Path(tmpdir, "manifest1.json").write_text(json.dumps(manifest))
+            result = load_flagged_keys(Path(tmpdir))
+            assert "pistoletto.moe" in result
+            assert len(result["pistoletto.moe"]) == 2
+            assert "selected-images/abc/capture_1.jpg" in result["pistoletto.moe"]
+
+    def test_multiple_buckets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            m1 = {"bucket": "pistoletto.moe", "items": [{"s3_key": "a.jpg", "blend_ids": []}]}
+            m2 = {"bucket": "pistoletto.moe2", "items": [{"s3_key": "b.jpg", "blend_ids": []}]}
+            Path(tmpdir, "m1.json").write_text(json.dumps(m1))
+            Path(tmpdir, "m2.json").write_text(json.dumps(m2))
+            result = load_flagged_keys(Path(tmpdir))
+            assert len(result) == 2
+            assert "a.jpg" in result["pistoletto.moe"]
+            assert "b.jpg" in result["pistoletto.moe2"]
+
+    def test_same_bucket_merges(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            m1 = {"bucket": "pistoletto.moe", "items": [{"s3_key": "a.jpg", "blend_ids": []}]}
+            m2 = {"bucket": "pistoletto.moe", "items": [{"s3_key": "b.jpg", "blend_ids": []}]}
+            Path(tmpdir, "m1.json").write_text(json.dumps(m1))
+            Path(tmpdir, "m2.json").write_text(json.dumps(m2))
+            result = load_flagged_keys(Path(tmpdir))
+            assert len(result["pistoletto.moe"]) == 2
+
+    def test_empty_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assert load_flagged_keys(Path(tmpdir)) == {}
+
+    def test_nonexistent_dir(self):
+        assert load_flagged_keys(Path("/nonexistent/path")) == {}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python -m pytest test_migrate.py -v`
+
+Expected: ImportError — `cannot import name 'is_participant_session' from 'migrate'` (module doesn't exist yet)
+
+- [ ] **Step 3: Write the implementation**
+
+Create `utils/data-scrubbing/migrate.py`:
+
+```python
 #!/usr/bin/env python3
 """
 Asset migration pipeline for verified good assets.
@@ -22,7 +194,7 @@ import sys
 from datetime import datetime, date, timezone
 from pathlib import Path
 
-from config import get_s3_client, get_dynamodb_resource, BLENDS, IMAGE_PREFIX, IMAGE_EXTENSIONS
+from config import get_s3_client, BLENDS, IMAGE_PREFIX, IMAGE_EXTENSIONS
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -31,8 +203,6 @@ from config import get_s3_client, get_dynamodb_resource, BLENDS, IMAGE_PREFIX, I
 SANITIZED_BUCKET = BLENDS[5]["bucket"]  # pistoletto.sanitized
 REVIEWED_PREFIX = "selected-images/reviewed-images/"
 MANIFEST_DIR = Path(__file__).resolve().parent / "reviewed_assets"
-CENTRAL_TABLE = "eternity-mirror-blends-central"
-S3_URL_BASE = f"https://s3.us-east-2.amazonaws.com/{SANITIZED_BUCKET}/"
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -117,8 +287,42 @@ def list_s3_images(s3, bucket: str, prefix: str = IMAGE_PREFIX) -> list[str]:
             if ext in IMAGE_EXTENSIONS:
                 keys.append(key)
     return keys
+```
 
+- [ ] **Step 4: Run tests to verify they pass**
 
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python -m pytest test_migrate.py -v`
+
+Expected: All 16 tests PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /Users/yonatan/Desktop/mosaic-tests
+git add utils/data-scrubbing/migrate.py utils/data-scrubbing/test_migrate.py
+git commit -m "feat: add shared helper functions for asset migration pipeline
+
+Adds UUID validation, date parsing, dedup key extraction, manifest
+loading, and S3 listing helpers. Includes unit tests for all pure
+functions."
+```
+
+---
+
+### Task 2: `migrate` Subcommand
+
+**Files:**
+- Modify: `utils/data-scrubbing/migrate.py`
+
+**Interfaces:**
+- Consumes: `is_participant_session`, `parse_capture_date`, `load_flagged_keys`, `list_s3_images`, `SANITIZED_BUCKET`, `REVIEWED_PREFIX`, `DEFAULT_RANGES`, `MANIFEST_DIR`, `BLENDS`, `get_s3_client`
+- Produces: `run_migrate(args) -> None` — callable from CLI, writes JSON log to disk
+
+- [ ] **Step 1: Add run_migrate function and CLI scaffold**
+
+Append to `utils/data-scrubbing/migrate.py` (after the helper functions):
+
+```python
 # ---------------------------------------------------------------------------
 # Subcommand: migrate
 # ---------------------------------------------------------------------------
@@ -278,6 +482,102 @@ def run_migrate(args):
 
 
 # ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Asset migration pipeline for verified good assets"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # migrate
+    mig = sub.add_parser("migrate", help="Copy verified good assets to sanitized bucket")
+    mig.add_argument("--dry-run", action="store_true", help="Preview without copying")
+    mig.add_argument("--system", type=int, choices=[1, 2, 3],
+                     help="Process a single system (default: all three)")
+    mig.add_argument("--start-date", type=date.fromisoformat,
+                     help="Override start date (YYYY-MM-DD), requires --system")
+    mig.add_argument("--end-date", type=date.fromisoformat,
+                     help="Override end date (YYYY-MM-DD), requires --system")
+
+    # dedup (placeholder — implemented in Task 3)
+    sub.add_parser("dedup", help="Scan sanitized bucket for duplicate assets")
+
+    # audit-system4 (placeholder — implemented in Task 4)
+    sub.add_parser("audit-system4", help="Diagnostic report of system 4 coverage")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.command == "migrate":
+        run_migrate(args)
+    elif args.command == "dedup":
+        print("dedup: not yet implemented")
+    elif args.command == "audit-system4":
+        print("audit-system4: not yet implemented")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 2: Verify CLI scaffold works**
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python migrate.py --help`
+
+Expected: Help text showing the three subcommands
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python migrate.py migrate --help`
+
+Expected: Help text showing `--dry-run`, `--system`, `--start-date`, `--end-date`
+
+- [ ] **Step 3: Verify migrate dry-run against real S3**
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python migrate.py migrate --system 1 --dry-run`
+
+Expected: Output showing listing from `pistoletto.moe`, filtering results, and "Would copy N/N..." lines. JSON log written. Verify:
+- Non-participant count > 0 (resized_white_bg etc. are filtered)
+- Flagged count > 0 (manifest keys are excluded)
+- No actual copies made (dry-run)
+
+- [ ] **Step 4: Run existing tests still pass**
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python -m pytest test_migrate.py -v`
+
+Expected: All 16 tests still PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /Users/yonatan/Desktop/mosaic-tests
+git add utils/data-scrubbing/migrate.py
+git commit -m "feat: add migrate subcommand to copy verified assets to sanitized bucket
+
+Lists source bucket assets, filters by UUID session, date range, and
+deletion manifests, then copies good assets to reviewed-images/ in the
+sanitized bucket. Supports --dry-run, --system, --start-date, --end-date."
+```
+
+---
+
+### Task 3: `dedup` Subcommand
+
+**Files:**
+- Modify: `utils/data-scrubbing/migrate.py`
+
+**Interfaces:**
+- Consumes: `extract_dedup_key`, `list_s3_images`, `SANITIZED_BUCKET`, `get_s3_client`
+- Produces: `run_dedup(args) -> None` — scans sanitized bucket, reports duplicates, optionally cleans
+
+- [ ] **Step 1: Add run_dedup function**
+
+Insert in `utils/data-scrubbing/migrate.py` after `run_migrate` and before `parse_args`:
+
+```python
+# ---------------------------------------------------------------------------
 # Subcommand: dedup
 # ---------------------------------------------------------------------------
 
@@ -339,100 +639,17 @@ def run_dedup(args):
 
     # Clean duplicates
     if clean and duplicates:
-        # Build redirect map: deleted_key -> kept_key
-        redirect_map: dict[str, str] = {}
+        print(f"\n{mode}Cleaning duplicates...")
+        deleted: list[str] = []
+        failed: list[dict] = []
+
         for dk, paths in duplicates.items():
+            # Prefer the reviewed-images copy; fall back to first found
             reviewed = [p for p in paths if "/reviewed-images/" in p]
             keep = reviewed[0] if reviewed else paths[0]
-            for p in paths:
-                if p != keep:
-                    redirect_map[p] = keep
+            to_delete = [p for p in paths if p != keep]
 
-        # Scan DynamoDB for records referencing keys we're about to delete
-        print(f"\n{mode}Scanning DynamoDB table {CENTRAL_TABLE} for affected references...")
-        dynamodb = get_dynamodb_resource()
-        table = dynamodb.Table(CENTRAL_TABLE)
-        db_items: list[dict] = []
-        scan_kwargs: dict = {}
-        while True:
-            resp = table.scan(**scan_kwargs)
-            db_items.extend(resp.get("Items", []))
-            last = resp.get("LastEvaluatedKey")
-            if not last:
-                break
-            scan_kwargs["ExclusiveStartKey"] = last
-
-        # Find records that reference deleted keys (check both image fields)
-        KEY_FIELDS = [
-            ("source_image_key", "source_image_bucket", "source_image_url"),
-            ("random_image_key", "random_image_bucket", "random_image_url"),
-        ]
-        redirects: list[dict] = []
-        for item in db_items:
-            for key_field, bucket_field, url_field in KEY_FIELDS:
-                raw_key = item.get(key_field, "")
-                bucket_val = item.get(bucket_field, "")
-                # Handle both bare keys and bucket-prefixed keys
-                if bucket_val == SANITIZED_BUCKET and raw_key in redirect_map:
-                    redirects.append({
-                        "blend_id": item["blend_id"],
-                        "field": key_field,
-                        "old_key": raw_key,
-                        "new_key": redirect_map[raw_key],
-                        "url_field": url_field,
-                    })
-                elif raw_key.startswith(SANITIZED_BUCKET + "/"):
-                    bare = raw_key[len(SANITIZED_BUCKET) + 1:]
-                    if bare in redirect_map:
-                        redirects.append({
-                            "blend_id": item["blend_id"],
-                            "field": key_field,
-                            "old_key": raw_key,
-                            "new_key": SANITIZED_BUCKET + "/" + redirect_map[bare],
-                            "url_field": url_field,
-                        })
-
-        print(f"  Found {len(redirects)} DynamoDB references to update")
-
-        # Update DynamoDB references
-        db_updated = 0
-        db_failed: list[dict] = []
-        for redir in redirects:
-            new_url = S3_URL_BASE + redir["new_key"]
-            if dry_run:
-                print(f"  [DRY-RUN] Would update {CENTRAL_TABLE}[{redir['blend_id'][:12]}...].{redir['field']}: {redir['old_key'][-50:]} -> {redir['new_key'][-50:]}")
-                db_updated += 1
-            else:
-                try:
-                    table.update_item(
-                        Key={"blend_id": redir["blend_id"]},
-                        UpdateExpression=f"SET #kf = :nk, #uf = :nu",
-                        ExpressionAttributeNames={
-                            "#kf": redir["field"],
-                            "#uf": redir["url_field"],
-                        },
-                        ExpressionAttributeValues={
-                            ":nk": redir["new_key"],
-                            ":nu": new_url,
-                        },
-                    )
-                    print(f"  Updated {CENTRAL_TABLE}[{redir['blend_id'][:12]}...].{redir['field']}")
-                    db_updated += 1
-                except Exception as e:
-                    print(f"  FAILED updating {redir['blend_id']}: {e}")
-                    db_failed.append({"blend_id": redir["blend_id"], "error": str(e)})
-
-        print(f"  {mode}DynamoDB: {db_updated} updated, {len(db_failed)} failed")
-
-        if db_failed:
-            print("  ERROR: DynamoDB updates failed — aborting S3 deletions to prevent broken references.")
-        else:
-            # Delete duplicate S3 objects
-            print(f"\n{mode}Deleting duplicate S3 objects...")
-            deleted: list[str] = []
-            failed: list[dict] = []
-
-            for key, keep in redirect_map.items():
+            for key in to_delete:
                 if dry_run:
                     print(f"  [DRY-RUN] Would delete {key} (keeping {keep})")
                     deleted.append(key)
@@ -445,11 +662,69 @@ def run_dedup(args):
                         print(f"  FAILED: {key} — {e}")
                         failed.append({"key": key, "error": str(e)})
 
-            print(f"\n  {mode}Clean summary: {len(deleted)} S3 objects deleted, {len(failed)} failed")
+        print(f"\n  {mode}Clean summary: {len(deleted)} deleted, {len(failed)} failed")
     elif clean and not duplicates:
         print("\n  No duplicates found — nothing to clean.")
+```
 
+- [ ] **Step 2: Update CLI to wire dedup subcommand**
 
+In `parse_args`, replace the dedup placeholder with:
+
+```python
+    # dedup
+    ded = sub.add_parser("dedup", help="Scan sanitized bucket for duplicate assets")
+    ded.add_argument("--clean", action="store_true", help="Delete duplicate copies (keeps reviewed-images)")
+    ded.add_argument("--dry-run", action="store_true", help="Preview without deleting")
+```
+
+In `main`, replace the dedup placeholder with:
+
+```python
+    elif args.command == "dedup":
+        run_dedup(args)
+```
+
+- [ ] **Step 3: Verify dedup report-only mode against real S3**
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python migrate.py dedup`
+
+Expected: Output showing total assets scanned, unique count, and any duplicate groups found. JSON report written. No deletions.
+
+- [ ] **Step 4: Run all tests still pass**
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python -m pytest test_migrate.py -v`
+
+Expected: All 16 tests PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /Users/yonatan/Desktop/mosaic-tests
+git add utils/data-scrubbing/migrate.py
+git commit -m "feat: add dedup subcommand to detect and clean duplicate assets
+
+Scans all selected-images/ in the sanitized bucket, groups by
+uuid/filename dedup key, reports duplicates. Supports --clean to
+remove extras (prefers reviewed-images copies) and --dry-run."
+```
+
+---
+
+### Task 4: `audit-system4` Subcommand
+
+**Files:**
+- Modify: `utils/data-scrubbing/migrate.py`
+
+**Interfaces:**
+- Consumes: `is_participant_session`, `extract_dedup_key`, `list_s3_images`, `SANITIZED_BUCKET`, `BLENDS`, `get_s3_client`
+- Produces: `run_audit_system4(args) -> None` — diagnostic report comparing system 4 vs sanitized
+
+- [ ] **Step 1: Add run_audit_system4 function**
+
+Insert in `utils/data-scrubbing/migrate.py` after `run_dedup` and before `parse_args`:
+
+```python
 # ---------------------------------------------------------------------------
 # Subcommand: audit-system4
 # ---------------------------------------------------------------------------
@@ -534,48 +809,37 @@ def run_audit_system4(args):
     report_path = Path(__file__).resolve().parent / f"audit_system4_{int(datetime.now().timestamp())}.json"
     report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     print(f"\n  Report saved to: {report_path}")
+```
 
+- [ ] **Step 2: Update CLI to wire audit-system4**
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+In `parse_args`, the audit-system4 parser is already added (no args needed). In `main`, replace the placeholder with:
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Asset migration pipeline for verified good assets"
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    # migrate
-    mig = sub.add_parser("migrate", help="Copy verified good assets to sanitized bucket")
-    mig.add_argument("--dry-run", action="store_true", help="Preview without copying")
-    mig.add_argument("--system", type=int, choices=[1, 2, 3],
-                     help="Process a single system (default: all three)")
-    mig.add_argument("--start-date", type=date.fromisoformat,
-                     help="Override start date (YYYY-MM-DD), requires --system")
-    mig.add_argument("--end-date", type=date.fromisoformat,
-                     help="Override end date (YYYY-MM-DD), requires --system")
-
-    # dedup
-    ded = sub.add_parser("dedup", help="Scan sanitized bucket for duplicate assets")
-    ded.add_argument("--clean", action="store_true", help="Delete duplicate copies (keeps reviewed-images)")
-    ded.add_argument("--dry-run", action="store_true", help="Preview without deleting")
-
-    # audit-system4
-    sub.add_parser("audit-system4", help="Diagnostic report of system 4 coverage")
-
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    if args.command == "migrate":
-        run_migrate(args)
-    elif args.command == "dedup":
-        run_dedup(args)
+```python
     elif args.command == "audit-system4":
         run_audit_system4(args)
+```
 
+- [ ] **Step 3: Verify audit against real S3**
 
-if __name__ == "__main__":
-    main()
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python migrate.py audit-system4`
+
+Expected: Output showing system 4 participant asset count, how many are present/missing in sanitized bucket. JSON report written.
+
+- [ ] **Step 4: Run all tests still pass**
+
+Run: `cd /Users/yonatan/Desktop/mosaic-tests/utils/data-scrubbing && python -m pytest test_migrate.py -v`
+
+Expected: All 16 tests PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /Users/yonatan/Desktop/mosaic-tests
+git add utils/data-scrubbing/migrate.py
+git commit -m "feat: add audit-system4 subcommand for system 4 coverage diagnostic
+
+Compares participant assets in pistoletto.moe4 against the sanitized
+bucket using uuid/filename dedup keys. Reports present and missing
+asset counts with full JSON report."
+```
