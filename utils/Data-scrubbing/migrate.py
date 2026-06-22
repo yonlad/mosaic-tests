@@ -276,6 +276,96 @@ def run_migrate(args):
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: dedup
+# ---------------------------------------------------------------------------
+
+def run_dedup(args):
+    """Scan the sanitized bucket for duplicate assets and optionally clean them."""
+    s3 = get_s3_client()
+    dry_run = args.dry_run
+    clean = args.clean
+    mode = "[DRY-RUN] " if dry_run else ""
+
+    print(f"Scanning {SANITIZED_BUCKET} for duplicate assets...")
+    all_keys = list_s3_images(s3, SANITIZED_BUCKET)
+    print(f"  Found {len(all_keys)} total assets")
+
+    # Group by dedup key
+    groups: dict[str, list[str]] = {}
+    skipped = 0
+    for key in all_keys:
+        dk = extract_dedup_key(key)
+        if dk is None:
+            skipped += 1
+            continue
+        groups.setdefault(dk, []).append(key)
+
+    duplicates = {dk: paths for dk, paths in groups.items() if len(paths) > 1}
+    total_extra = sum(len(paths) - 1 for paths in duplicates.values())
+
+    # Report
+    print(f"\n{'='*60}")
+    print(f"  Dedup Report — {SANITIZED_BUCKET}")
+    print(f"{'='*60}")
+    print(f"  Total assets scanned: {len(all_keys)}")
+    print(f"  Skipped (no UUID): {skipped}")
+    print(f"  Unique assets: {len(groups)}")
+    print(f"  Duplicated assets: {len(duplicates)}")
+    print(f"  Extra copies: {total_extra}")
+
+    if duplicates:
+        print(f"\n  Duplicate groups:")
+        for dk, paths in sorted(duplicates.items()):
+            print(f"\n    {dk}:")
+            for p in paths:
+                print(f"      - {p}")
+
+    # Write report JSON
+    report = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "bucket": SANITIZED_BUCKET,
+        "total_scanned": len(all_keys),
+        "skipped_no_uuid": skipped,
+        "unique_assets": len(groups),
+        "duplicate_groups": len(duplicates),
+        "extra_copies": total_extra,
+        "duplicates": {dk: paths for dk, paths in sorted(duplicates.items())},
+    }
+    report_path = Path(__file__).resolve().parent / f"dedup_report_{int(datetime.now().timestamp())}.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\n  Report saved to: {report_path}")
+
+    # Clean duplicates
+    if clean and duplicates:
+        print(f"\n{mode}Cleaning duplicates...")
+        deleted: list[str] = []
+        failed: list[dict] = []
+
+        for dk, paths in duplicates.items():
+            # Prefer the reviewed-images copy; fall back to first found
+            reviewed = [p for p in paths if "/reviewed-images/" in p]
+            keep = reviewed[0] if reviewed else paths[0]
+            to_delete = [p for p in paths if p != keep]
+
+            for key in to_delete:
+                if dry_run:
+                    print(f"  [DRY-RUN] Would delete {key} (keeping {keep})")
+                    deleted.append(key)
+                else:
+                    try:
+                        s3.delete_object(Bucket=SANITIZED_BUCKET, Key=key)
+                        print(f"  Deleted: {key} (keeping {keep})")
+                        deleted.append(key)
+                    except Exception as e:
+                        print(f"  FAILED: {key} — {e}")
+                        failed.append({"key": key, "error": str(e)})
+
+        print(f"\n  {mode}Clean summary: {len(deleted)} deleted, {len(failed)} failed")
+    elif clean and not duplicates:
+        print("\n  No duplicates found — nothing to clean.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -295,8 +385,10 @@ def parse_args():
     mig.add_argument("--end-date", type=date.fromisoformat,
                      help="Override end date (YYYY-MM-DD), requires --system")
 
-    # dedup (placeholder -- implemented in Task 3)
-    sub.add_parser("dedup", help="Scan sanitized bucket for duplicate assets")
+    # dedup
+    ded = sub.add_parser("dedup", help="Scan sanitized bucket for duplicate assets")
+    ded.add_argument("--clean", action="store_true", help="Delete duplicate copies (keeps reviewed-images)")
+    ded.add_argument("--dry-run", action="store_true", help="Preview without deleting")
 
     # audit-system4 (placeholder -- implemented in Task 4)
     sub.add_parser("audit-system4", help="Diagnostic report of system 4 coverage")
@@ -309,7 +401,7 @@ def main():
     if args.command == "migrate":
         run_migrate(args)
     elif args.command == "dedup":
-        print("dedup: not yet implemented")
+        run_dedup(args)
     elif args.command == "audit-system4":
         print("audit-system4: not yet implemented")
 
