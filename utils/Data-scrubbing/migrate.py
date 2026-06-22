@@ -366,6 +366,92 @@ def run_dedup(args):
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: audit-system4
+# ---------------------------------------------------------------------------
+
+def run_audit_system4(args):
+    """Produce a diagnostic report of system 4 asset coverage in the sanitized bucket."""
+    s3 = get_s3_client()
+    source_bucket = BLENDS[4]["bucket"]
+
+    print(f"Auditing system 4 ({source_bucket}) coverage in {SANITIZED_BUCKET}...\n")
+
+    # List system 4 assets
+    print(f"Listing assets in {source_bucket}...")
+    sys4_keys = list_s3_images(s3, source_bucket)
+    print(f"  Found {len(sys4_keys)} total images")
+
+    # Filter to participant sessions only
+    sys4_participant: list[str] = []
+    for key in sys4_keys:
+        parts = key.split("/")
+        if len(parts) >= 3 and is_participant_session(parts[1]):
+            sys4_participant.append(key)
+    print(f"  {len(sys4_participant)} participant session images")
+
+    # List sanitized assets and build dedup key lookup
+    print(f"\nListing assets in {SANITIZED_BUCKET}...")
+    sanitized_keys = list_s3_images(s3, SANITIZED_BUCKET)
+    print(f"  Found {len(sanitized_keys)} total images")
+
+    sanitized_dedup: dict[str, list[str]] = {}
+    for key in sanitized_keys:
+        dk = extract_dedup_key(key)
+        if dk:
+            sanitized_dedup.setdefault(dk, []).append(key)
+
+    # Compare
+    present: list[dict] = []
+    missing: list[str] = []
+    for key in sys4_participant:
+        dk = extract_dedup_key(key)
+        if dk and dk in sanitized_dedup:
+            present.append({
+                "source_key": key,
+                "dedup_key": dk,
+                "found_at": sanitized_dedup[dk],
+            })
+        else:
+            missing.append(key)
+
+    # Report
+    print(f"\n{'='*60}")
+    print(f"  System 4 Audit — {source_bucket}")
+    print(f"{'='*60}")
+    print(f"  Total participant assets: {len(sys4_participant)}")
+    print(f"  Present in sanitized: {len(present)}")
+    print(f"  Missing from sanitized: {len(missing)}")
+
+    if missing:
+        show = missing[:20]
+        print(f"\n  Missing assets (showing {len(show)} of {len(missing)}):")
+        for key in show:
+            print(f"    - {key}")
+        if len(missing) > 20:
+            print(f"    ... and {len(missing) - 20} more (see JSON report)")
+
+    if present:
+        print(f"\n  Sample present assets (showing up to 5):")
+        for item in present[:5]:
+            print(f"    - {item['dedup_key']} -> {item['found_at']}")
+
+    # Write report JSON
+    report = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_bucket": source_bucket,
+        "sanitized_bucket": SANITIZED_BUCKET,
+        "total_participant_assets": len(sys4_participant),
+        "present_in_sanitized": len(present),
+        "missing_from_sanitized": len(missing),
+        "present_details": present,
+        "missing_keys": missing,
+    }
+    report_path = Path(__file__).resolve().parent / f"audit_system4_{int(datetime.now().timestamp())}.json"
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    print(f"\n  Report saved to: {report_path}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -390,7 +476,7 @@ def parse_args():
     ded.add_argument("--clean", action="store_true", help="Delete duplicate copies (keeps reviewed-images)")
     ded.add_argument("--dry-run", action="store_true", help="Preview without deleting")
 
-    # audit-system4 (placeholder -- implemented in Task 4)
+    # audit-system4
     sub.add_parser("audit-system4", help="Diagnostic report of system 4 coverage")
 
     return parser.parse_args()
@@ -403,7 +489,7 @@ def main():
     elif args.command == "dedup":
         run_dedup(args)
     elif args.command == "audit-system4":
-        print("audit-system4: not yet implemented")
+        run_audit_system4(args)
 
 
 if __name__ == "__main__":
