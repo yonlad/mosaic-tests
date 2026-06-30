@@ -3,7 +3,7 @@ running full-body-mosaic-new.py:
 #senseitive command for white details and transparent thumbnail background:
 
 python full-body-mosaic-threshold.py \
-      --image "full-bod-imgs/prototypes/new-prot-2.png" \
+      --image "full-bod-imgs/prototypes/jasmine-full.png" \
       --s3-prefix "selected-images/" \
       --base-cell-size 5 \
       --foreground-min-cell-size 25 \

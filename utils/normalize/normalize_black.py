@@ -1,28 +1,20 @@
 """
-Batch image normalization pipeline for S3.
+Batch image normalization pipeline for S3 — BLACK BACKGROUND variant.
 
-Normalizes participant images on white backgrounds so that:
-  1. All output images have identical dimensions (7:10 aspect ratio)
-  2. Top of scalp is at exactly 40% from the top of the frame
-  3. Bottom of participant is flush with the bottom of the frame
-  4. Participant is horizontally centered
-
-Uses MediaPipe pose estimation for precise head-top detection and
-thresholding for body-bottom detection.
+Same normalization as normalize.py but adapted for images with black
+backgrounds instead of white:
+  - Body detection finds "non-black" pixels (bright pixels above threshold)
+  - Output canvas uses white background for consistency
 
 Usage
 -----
-  # Sample a single image (dry run with debug visualization)
-  python normalize.py --limit 1 --dry-run --debug
+  # Dry run with debug
+  python normalize_black.py --limit 3 --dry-run --debug
 
-  # Process 10 images as a test batch
-  python normalize.py --limit 10 --dry-run --debug
-
-  # Full production run
-  python normalize.py
-
-  # Process specific system only
-  python normalize.py --prefix system2
+  # Full run on sanitized bucket
+  python normalize_black.py --bucket pistoletto.sanitized \
+    --prefix selected-images/resized_black_bg/ \
+    --dest-prefix normalized/ --head-position 0.40
 """
 
 import os
@@ -67,8 +59,8 @@ AWS_SECRET_ACCESS_KEY = os.getenv(
     "AWS_SECRET_ACCESS_KEY", os.getenv("REACT_APP_AWS_SECRET_ACCESS_KEY")
 )
 
-DEFAULT_BUCKET = "pistoletto.standard"
-DEFAULT_PREFIX = "system"
+DEFAULT_BUCKET = "pistoletto.sanitized"
+DEFAULT_PREFIX = "selected-images/resized_black_bg/"
 DEFAULT_DEST_PREFIX = "normalized/"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 JPEG_QUALITY = 95
@@ -80,7 +72,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("normalize")
+logger = logging.getLogger("normalize_black")
 
 # Thread-local S3 clients
 _thread_local = threading.local()
@@ -107,15 +99,10 @@ def scan_source_images(bucket, prefix):
     paginator = s3.get_paginator("list_objects_v2")
     keys = []
 
-    # SKIP_FOLDERS = ("flora-screenshots", "resized_black_bg")
-    SKIP_FOLDERS = ("resized_black_bg",)
-
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if key.endswith("/"):
-                continue
-            if any(f"/{folder}/" in key or key.startswith(f"{folder}/") for folder in SKIP_FOLDERS):
                 continue
             ext = os.path.splitext(key)[1].lower()
             if ext in IMAGE_EXTENSIONS:
@@ -124,26 +111,29 @@ def scan_source_images(bucket, prefix):
     return sorted(keys)
 
 
-# ── Body Bounds Detection ───────────────────────────────────────────────────
+# ── Body Bounds Detection (BLACK background) ──────────────────────────────
 
 
-def detect_body_bounds(pil_image, threshold=240):
+def detect_body_bounds(pil_image, black_threshold=30):
     """
-    Find bounding box of the person using non-white pixel detection.
+    Find bounding box of the person using non-black pixel detection.
+
+    For black background images, a pixel is "non-black" (i.e. part of the
+    person) if ANY channel is ABOVE the threshold.
 
     Returns: (top_y, bottom_y, left_x, right_x) in pixels,
              or None if no person found.
     """
     rgb = np.array(pil_image.convert("RGB"))
 
-    # A pixel is "non-white" if ANY channel is below threshold
-    non_white = np.any(rgb < threshold, axis=2)
+    # A pixel is "non-black" if ANY channel is above threshold
+    non_black = np.any(rgb > black_threshold, axis=2)
 
-    if not non_white.any():
+    if not non_black.any():
         return None
 
-    rows_with_content = np.any(non_white, axis=1)
-    cols_with_content = np.any(non_white, axis=0)
+    rows_with_content = np.any(non_black, axis=1)
+    cols_with_content = np.any(non_black, axis=0)
 
     row_indices = np.where(rows_with_content)[0]
     col_indices = np.where(cols_with_content)[0]
@@ -160,21 +150,21 @@ def detect_body_bounds(pil_image, threshold=240):
 
 
 def normalize_image(pil_image, canvas_w=2100, canvas_h=3000,
-                    crown_margin=2.6, white_threshold=240,
-                    head_position=0.38):
+                    crown_margin=2.6, black_threshold=30,
+                    head_position=0.40):
     """
-    Normalize a participant image so that:
+    Normalize a participant image on a black background so that:
     - Head top (scalp) is at head_position fraction from top of canvas
     - Body bottom is flush with canvas bottom
     - Person is horizontally centered
-    - Output is canvas_w x canvas_h on white background
+    - Output is canvas_w x canvas_h on WHITE background
 
     Returns: (canvas_pil, metadata_dict) or (None, error_dict)
     """
     img_w, img_h = pil_image.size
 
-    # Step 1: Detect body bounds via thresholding
-    bounds = detect_body_bounds(pil_image, threshold=white_threshold)
+    # Step 1: Detect body bounds via thresholding (non-black pixels)
+    bounds = detect_body_bounds(pil_image, black_threshold=black_threshold)
     if bounds is None:
         return None, {"error": "no_person_detected", "method": "threshold_empty"}
 
@@ -194,7 +184,6 @@ def normalize_image(pil_image, canvas_w=2100, canvas_h=3000,
 
     # Step 3: Fallback if pose detection failed
     if head_top_y is None:
-        # Use threshold top with a small upward margin to approximate crown
         person_height_thresh = thresh_bottom_y - thresh_top_y
         crown_margin_px = person_height_thresh * 0.03
         head_top_y = max(0, thresh_top_y - crown_margin_px)
@@ -203,7 +192,6 @@ def normalize_image(pil_image, canvas_w=2100, canvas_h=3000,
     if person_center_x is None:
         person_center_x = (thresh_left_x + thresh_right_x) / 2
 
-    # Use threshold for body bottom (more reliable than pose for bottom edge)
     body_bottom_y = thresh_bottom_y
 
     # Step 4: Compute scale factor
@@ -222,18 +210,18 @@ def normalize_image(pil_image, canvas_w=2100, canvas_h=3000,
 
     resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
 
-    # Step 6: Compute placement on white canvas
+    # Step 6: Compute placement on black canvas
     scaled_body_bottom_y = body_bottom_y * scale_factor
     scaled_center_x = person_center_x * scale_factor
 
     paste_y = round(canvas_h - scaled_body_bottom_y)
     paste_x = round(canvas_w / 2 - scaled_center_x)
 
-    # Step 7: Composite onto white canvas
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    # Step 7: Composite onto black canvas
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
     canvas.paste(resized, (paste_x, paste_y))
 
-    # Step 8: Compute verification metrics
+    # Step 9: Compute verification metrics
     scaled_head_top_y = head_top_y * scale_factor
     actual_head_top_on_canvas = paste_y + scaled_head_top_y
     expected_head_top = canvas_h * head_position
@@ -259,6 +247,7 @@ def normalize_image(pil_image, canvas_w=2100, canvas_h=3000,
         "deviation_percent": round(deviation_pct, 3),
         "detection_method": detection_method,
         "paste_offset": (paste_x, paste_y),
+        "bg_conversion": "black_to_white",
         "review_needed": review_reasons if review_reasons else None,
     }
 
@@ -268,7 +257,7 @@ def normalize_image(pil_image, canvas_w=2100, canvas_h=3000,
 # ── Debug Visualization ─────────────────────────────────────────────────────
 
 
-def draw_debug(original, normalized, metadata, canvas_h, head_position=0.38):
+def draw_debug(original, normalized, metadata, canvas_h, head_position=0.40):
     """
     Create a side-by-side debug visualization.
     Left: original with annotations. Right: normalized with head_position guideline.
@@ -276,41 +265,33 @@ def draw_debug(original, normalized, metadata, canvas_h, head_position=0.38):
     orig_w, orig_h = original.size
     norm_w, norm_h = normalized.size
 
-    # Scale original to match normalized height for side-by-side
     scale = norm_h / orig_h
     disp_orig_w = round(orig_w * scale)
     disp_orig = original.resize((disp_orig_w, norm_h), Image.LANCZOS)
 
-    # Create side-by-side canvas
     gap = 20
     total_w = disp_orig_w + gap + norm_w
     debug_canvas = Image.new("RGB", (total_w, norm_h + 40), (40, 40, 40))
 
-    # Paste original (left)
     debug_canvas.paste(disp_orig, (0, 40))
-
-    # Paste normalized (right)
     debug_canvas.paste(normalized, (disp_orig_w + gap, 40))
 
     draw = ImageDraw.Draw(debug_canvas)
 
-    # Draw head_position guideline on normalized image
-    guideline_y = round(canvas_h * head_position) + 40  # +40 for header
+    guideline_y = round(canvas_h * head_position) + 40
     right_x_start = disp_orig_w + gap
     draw.line(
         [(right_x_start, guideline_y), (right_x_start + norm_w, guideline_y)],
         fill="red", width=2,
     )
 
-    # Label
     method = metadata.get("detection_method", "?")
     sf = metadata.get("scale_factor", 0)
     dev = metadata.get("deviation_percent", 0)
     orig_size = metadata.get("original_size", (0, 0))
-    label = f"Method: {method} | Scale: {sf:.2f}x | Dev: {dev:.2f}% | Orig: {orig_size[0]}x{orig_size[1]}"
+    label = f"Method: {method} | Scale: {sf:.2f}x | Dev: {dev:.2f}% | Orig: {orig_size[0]}x{orig_size[1]} | BG: black→white"
     draw.text((10, 10), label, fill="white")
 
-    # Draw text label on the guideline
     draw.text((right_x_start + 5, guideline_y - 15), f"{head_position:.0%} line", fill="red")
 
     return debug_canvas
@@ -331,10 +312,7 @@ def process_one(src_key, bucket, dest_prefix, args):
 
     s3 = _get_s3_client()
 
-    # Compute destination key preserving directory structure
-    # e.g. system1/selected-images/uuid/file.jpg → normalized/system1/selected-images/uuid/file.jpg
     dest_key = f"{dest_prefix}{src_key}"
-    # Change extension to .jpg
     dest_key = os.path.splitext(dest_key)[0] + ".jpg"
     result["dest_key"] = dest_key
 
@@ -359,7 +337,7 @@ def process_one(src_key, bucket, dest_prefix, args):
             canvas_w=args.output_width,
             canvas_h=args.output_height,
             crown_margin=args.crown_margin,
-            white_threshold=args.white_threshold,
+            black_threshold=args.black_threshold,
             head_position=args.head_position,
         )
 
@@ -378,14 +356,12 @@ def process_one(src_key, bucket, dest_prefix, args):
         if args.dry_run:
             dry_dir = SCRIPT_DIR / "dry_run_output"
             dry_dir.mkdir(exist_ok=True)
-            # Use a flat filename for easy browsing
             flat_name = src_key.replace("/", "__")
             flat_name = os.path.splitext(flat_name)[0] + ".jpg"
             (dry_dir / flat_name).write_bytes(jpeg_bytes)
             result["status"] = "dry-run"
             result["local_path"] = str(dry_dir / flat_name)
 
-            # Save debug visualization if requested
             if args.debug:
                 debug_img = draw_debug(
                     pil_image, normalized, metadata,
@@ -414,7 +390,7 @@ def process_one(src_key, bucket, dest_prefix, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Normalize participant images to consistent framing"
+        description="Normalize black-background images to consistent framing (white output)"
     )
     parser.add_argument("--bucket", default=DEFAULT_BUCKET,
                         help=f"S3 bucket (default: {DEFAULT_BUCKET})")
@@ -436,11 +412,10 @@ def main():
                         help="Output canvas height in pixels (default: 3000)")
     parser.add_argument("--crown-margin", type=float, default=2.6,
                         help="Crown margin multiplier (default: 2.6)")
-    parser.add_argument("--white-threshold", type=int, default=240,
-                        help="Non-white pixel threshold (default: 240)")
-    parser.add_argument("--head-position", type=float, default=0.38,
-                        help="Scalp position as fraction from top (default: 0.38 = 38%% from top). "
-                             "Lower = person higher in frame. Based on proportions reference.")
+    parser.add_argument("--black-threshold", type=int, default=30,
+                        help="Non-black pixel threshold (default: 30)")
+    parser.add_argument("--head-position", type=float, default=0.40,
+                        help="Scalp position as fraction from top (default: 0.40)")
     args = parser.parse_args()
 
     logger.info(f"Scanning s3://{args.bucket}/{args.prefix}*...")
@@ -465,7 +440,7 @@ def main():
     start_time = time.time()
 
     if HAS_TQDM:
-        progress = tqdm(total=len(all_keys), desc="Normalizing", unit="img")
+        progress = tqdm(total=len(all_keys), desc="Normalizing (black bg)", unit="img")
     else:
         progress = None
 
@@ -542,7 +517,7 @@ def main():
         "output_dimensions": [args.output_width, args.output_height],
         "crown_margin": args.crown_margin,
         "head_position": args.head_position,
-        "white_threshold": args.white_threshold,
+        "black_threshold": args.black_threshold,
         "total_scanned": len(all_keys),
         "elapsed_seconds": round(elapsed, 1),
         "summary": {
@@ -555,7 +530,7 @@ def main():
         "results": results,
     }
 
-    log_name = f"normalize_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    log_name = f"normalize_black_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     log_path = SCRIPT_DIR / log_name
     with open(log_path, "w") as f:
         json.dump(log_data, f, indent=2, default=str)
